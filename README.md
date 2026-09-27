@@ -17,7 +17,7 @@ A single Python script (standard library only) runs `zk graph`, serves the resul
 - **Saved views**: save the current set of notes, their positions and the zoom (**Save view** / **Ctrl+S**), switch between views from the dropdown, or open one with `--view NAME`. See [Saved views](#saved-views).
 - Search box (**Ctrl+F**) dims non-matching notes; **Enter** jumps to the first match.
 - **Space** freezes or unfreezes the physics simulation.
-- Colour notes by tag.
+- Colour notes by tag and by directory.
 - Works offline: vis-network is bundled, nothing is loaded from a CDN.
 
 ## Requirements
@@ -82,7 +82,16 @@ default_color = "#97c2fc"
 [tag_colors]
 todo = "#e74c3c"
 draft = "#f39c12"
+
+# Colour for notes in a directory that have none of the tags above.
+[dir_colors]
+"permanent" = "#e5c07b"
 ```
+
+A note's colour is decided in this order:
+1. The first tag in `tag_colors` that the note has.
+2. Otherwise, the most specific directory in `dir_colors` that contains the note. Subdirectories count, so `"journal"` also covers `journal/2026/`, and `"journal/2026"` beats `"journal"`.
+3. Otherwise, `default_color`.
 
 Without a config file, notes open with `xdg-open` and all nodes share one colour.
 

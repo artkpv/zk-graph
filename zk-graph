@@ -31,6 +31,9 @@ CONFIG_NAME = "zk-graph.toml"  # looked up in <notebook>/.zk/
 NOTES_DIR = "."  # set in main()
 # Order matters: the first tag listed here that a note has decides its colour.
 TAG_COLORS = {}
+# Directory (relative to the notebook) -> colour for notes with no coloured tag.
+# Sorted longest first, so the most specific directory wins.
+DIR_COLORS = {}
 DEFAULT_COLOR = "#97c2fc"
 OPEN_CMD = ["xdg-open", "{path}"]
 VIEWS_DIR = Path(".")  # set by load_config()
@@ -59,7 +62,7 @@ def find_notebook_dir(start):
 
 def load_config(notebook):
     """Apply <notebook>/.zk/zk-graph.toml, if present, to the module settings."""
-    global TAG_COLORS, DEFAULT_COLOR, OPEN_CMD, VIEWS_DIR
+    global TAG_COLORS, DIR_COLORS, DEFAULT_COLOR, OPEN_CMD, VIEWS_DIR
     VIEWS_DIR = notebook / ".zk" / "zk-graph" / "views"
     path = notebook / ".zk" / CONFIG_NAME
     if not path.is_file():
@@ -69,6 +72,8 @@ def load_config(notebook):
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise ZkError(f"Cannot read {path}: {e}")
     TAG_COLORS = dict(cfg.get("tag_colors", TAG_COLORS))
+    dirs = {d.strip("/"): c for d, c in cfg.get("dir_colors", {}).items() if d.strip("/")}
+    DIR_COLORS = dict(sorted(dirs.items(), key=lambda kv: -len(kv[0])))
     DEFAULT_COLOR = cfg.get("default_color", DEFAULT_COLOR)
     open_cmd = cfg.get("open_cmd", OPEN_CMD)
     OPEN_CMD = shlex.split(open_cmd) if isinstance(open_cmd, str) else list(open_cmd)
@@ -262,12 +267,23 @@ def filter_graph(data, adj, filter_str, filter_path, depth=1, direction="both"):
     return data
 
 
+def note_color(path, tags):
+    """First configured tag colour, else the most specific dir colour, else the default."""
+    for tag, color in TAG_COLORS.items():
+        if tag in tags:
+            return color
+    for d, color in DIR_COLORS.items():
+        if path.startswith(d + "/"):
+            return color
+    return DEFAULT_COLOR
+
+
 def note_to_vis_node(n, adj):
     label = n.get("title") or n.get("lead") or n.get("filenameStem") or n["path"]
     if len(label) > 60:
         label = label[:57] + "..."
     tags = n.get("tags") or []
-    color = next((c for t, c in TAG_COLORS.items() if t in tags), DEFAULT_COLOR)
+    color = note_color(n["path"], tags)
     tags_str = ", ".join(tags)
     n_out = len(linked(adj, n["path"], "out"))
     n_in = len(linked(adj, n["path"], "in"))
@@ -386,7 +402,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="btnSave" title="Ctrl+S">Save view</button>
 </div>
 <div id="legend">
-  <div><span style="background:@@DEFAULT_COLOR@@"></span>No tag</div>
 @@LEGEND_ITEMS@@
 </div>
 <div id="info"></div>
@@ -742,12 +757,14 @@ def script_json(obj):
 
 
 def make_html(vis_data, token, state):
+    entries = [(f"#{tag}", color) for tag, color in TAG_COLORS.items()]
+    entries += [(f"{d}/ (untagged)", color) for d, color in DIR_COLORS.items()]
+    entries.append(("Other" if TAG_COLORS or DIR_COLORS else "Note", DEFAULT_COLOR))
     legend_items = "\n".join(
-        f'  <div><span style="background:{color}"></span>{html_mod.escape(tag)}</div>'
-        for tag, color in TAG_COLORS.items()
+        f'  <div><span style="background:{html_mod.escape(color)}"></span>{html_mod.escape(label)}</div>'
+        for label, color in entries
     )
     subs = {
-        "DEFAULT_COLOR": DEFAULT_COLOR,
         "LEGEND_ITEMS": legend_items,
         "GRAPH_DATA": script_json(vis_data),
         "TOKEN": script_json(token),

@@ -22,3 +22,9 @@ todo = "#e74c3c"
 draft = "#f39c12"
 idea = "#9b59b6"
 published = "#2ecc71"
+
+# Directory -> colour for notes in it that have none of the tags above.
+# Paths are relative to the notebook; the most specific directory wins.
+[dir_colors]
+"permanent" = "#e5c07b"
+"journal/2026" = "#61afef"
