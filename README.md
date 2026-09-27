@@ -31,6 +31,10 @@ ln -s "$PWD/zk-graph/zk-graph" ~/.local/bin/zk-graph
 
 Keep `vis-network.min.js` next to the script. The symlink is resolved, so linking the script from elsewhere is fine.
 
+## Screenshot
+
+![scrn](screenshot_1790473090.png)
+
 ## Usage
 
 Run it from anywhere inside a notebook:
