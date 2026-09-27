@@ -35,7 +35,7 @@ Keep `vis-network.min.js` next to the script. The symlink is resolved, so linkin
 
 ## Screenshot
 
-![scrn](screenshot_1790473090.png)
+![scrn](screenshot.png)
 
 ## Usage
 
