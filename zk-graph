@@ -15,11 +15,13 @@ import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
 import urllib.parse
 import webbrowser
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -31,9 +33,15 @@ NOTES_DIR = "."  # set in main()
 TAG_COLORS = {}
 DEFAULT_COLOR = "#97c2fc"
 OPEN_CMD = ["xdg-open", "{path}"]
+VIEWS_DIR = Path(".")  # set by load_config()
+VIEW_NAME_RE = re.compile(r"\w[\w.-]*")
 
 
 class ZkError(Exception):
+    pass
+
+
+class ViewError(Exception):
     pass
 
 
@@ -51,7 +59,8 @@ def find_notebook_dir(start):
 
 def load_config(notebook):
     """Apply <notebook>/.zk/zk-graph.toml, if present, to the module settings."""
-    global TAG_COLORS, DEFAULT_COLOR, OPEN_CMD
+    global TAG_COLORS, DEFAULT_COLOR, OPEN_CMD, VIEWS_DIR
+    VIEWS_DIR = notebook / ".zk" / "zk-graph" / "views"
     path = notebook / ".zk" / CONFIG_NAME
     if not path.is_file():
         return
@@ -63,6 +72,92 @@ def load_config(notebook):
     DEFAULT_COLOR = cfg.get("default_color", DEFAULT_COLOR)
     open_cmd = cfg.get("open_cmd", OPEN_CMD)
     OPEN_CMD = shlex.split(open_cmd) if isinstance(open_cmd, str) else list(open_cmd)
+    if "views_dir" in cfg:
+        # Relative paths are relative to the notebook
+        VIEWS_DIR = notebook / Path(cfg["views_dir"]).expanduser()
+
+
+def view_path(name):
+    if not isinstance(name, str) or not VIEW_NAME_RE.fullmatch(name):
+        raise ViewError(f"Bad view name {name!r}: use letters, digits, '_', '.' and '-'")
+    return VIEWS_DIR / f"{name}.json"
+
+
+def list_views():
+    views = []
+    for p in sorted(VIEWS_DIR.glob("*.json")) if VIEWS_DIR.is_dir() else []:
+        if not VIEW_NAME_RE.fullmatch(p.stem):
+            continue
+        try:
+            view = json.loads(p.read_text())
+        except (OSError, ValueError):
+            view = {}
+        views.append({"name": p.stem, "saved": view.get("saved"), "count": len(view.get("nodes") or {})})
+    return views
+
+
+def read_view(name):
+    path = view_path(name)
+    try:
+        view = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise ViewError(f"No view {name!r} in {VIEWS_DIR}")
+    except (OSError, ValueError) as e:
+        raise ViewError(f"Cannot read {path}: {e}")
+    if not isinstance(view, dict) or not isinstance(view.get("nodes"), dict):
+        raise ViewError(f"{path} has no 'nodes' object")
+    return view
+
+
+def write_view(name, view):
+    """Write atomically: temp file in the same dir, then rename over the old view."""
+    path = view_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(view, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def _finite(value, what):
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        raise ViewError(f"Bad {what}: {value!r}")
+    if not math.isfinite(x):
+        raise ViewError(f"Bad {what}: {value!r}")
+    return x
+
+
+def clean_view(body):
+    """Validate a /views/save payload into the on-disk view format."""
+    nodes = body.get("nodes")
+    if not isinstance(nodes, dict):
+        raise ViewError("'nodes' must be an object")
+    clean_nodes = {}
+    for path, pos in nodes.items():
+        if not isinstance(pos, dict):
+            raise ViewError(f"Bad position for {path!r}")
+        clean_nodes[path] = {"x": round(_finite(pos.get("x"), "x"), 1),
+                             "y": round(_finite(pos.get("y"), "y"), 1)}
+    vp = body.get("viewport")
+    viewport = None
+    if isinstance(vp, dict):
+        viewport = {"scale": _finite(vp.get("scale"), "scale"),
+                    "x": round(_finite(vp.get("x"), "x"), 1), "y": round(_finite(vp.get("y"), "y"), 1)}
+    origin = body.get("origin")
+    return {
+        "version": 1,
+        "saved": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "nodes": clean_nodes,
+        "viewport": viewport,
+        "frozen": bool(body.get("frozen")),
+        "origin": origin if isinstance(origin, dict) else None,
+    }
 
 
 def get_graph_json():
@@ -214,6 +309,28 @@ def build_vis_data(data, adj):
     return {"nodes": nodes, "edges": edges}
 
 
+def view_to_vis(view, notes_by_path, links, adj):
+    """A saved view's notes with the notebook's current content and links, at
+    their saved positions. Returns (vis data, number of deleted notes dropped)."""
+    nodes = []
+    for path, pos in view["nodes"].items():
+        if path not in notes_by_path:
+            continue
+        node = note_to_vis_node(notes_by_path[path], adj)
+        if isinstance(pos, dict) and all(isinstance(pos.get(k), (int, float)) for k in ("x", "y")):
+            node["x"], node["y"] = pos["x"], pos["y"]
+        nodes.append(node)
+    edges = vis_edges(links, {n["id"] for n in nodes})
+    return {"nodes": nodes, "edges": edges}, len(view["nodes"]) - len(nodes)
+
+
+def view_state(view, name):
+    """What the page needs besides the graph to restore a view."""
+    vp = view.get("viewport")
+    return {"name": name, "viewport": vp if isinstance(vp, dict) else None,
+            "frozen": bool(view.get("frozen")), "origin": view.get("origin")}
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html>
 <head>
@@ -233,13 +350,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #toolbar {
     position: absolute; top: 10px; left: 10px; display: flex; gap: 6px;
   }
-  #toolbar button, #toolbar input {
+  #toolbar button, #toolbar input, #toolbar select {
     background: rgba(30,30,30,0.9); color: #ccc; border: 1px solid #555;
     padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px;
   }
   #toolbar button:hover { background: rgba(60,60,60,0.9); }
   #toolbar button.active { background: #e74c3c; color: #fff; border-color: #e74c3c; }
   #toolbar input { width: 180px; cursor: text; }
+  #toolbar select { max-width: 220px; }
   #info {
     position: absolute; bottom: 10px; left: 10px; background: rgba(30,30,30,0.9);
     color: #ccc; padding: 8px 12px; border-radius: 6px; font-size: 13px;
@@ -254,6 +372,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   #ctxmenu div:hover { background: #3a3a3a; }
   #ctxmenu div.sep { border-top: 1px solid #444; margin: 2px 0; padding: 0; cursor: default; }
+  #ctxmenu .key { float: right; margin-left: 16px; color: #777; }
 </style>
 </head>
 <body>
@@ -263,6 +382,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="btnFreeze" title="Space to toggle">Freeze</button>
   <button id="btnFit">Fit</button>
   <input id="search" type="text" placeholder="Search nodes..." title="Ctrl+F">
+  <select id="viewSelect" title="Switch to a saved view"></select>
+  <button id="btnSave" title="Ctrl+S">Save view</button>
 </div>
 <div id="legend">
   <div><span style="background:@@DEFAULT_COLOR@@"></span>No tag</div>
@@ -271,7 +392,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div id="info"></div>
 <div id="ctxmenu">
   <div data-dir="both">Add all linked notes</div>
-  <div data-dir="out">Add outgoing links</div>
+  <div data-dir="out">Add outgoing links <span class="key">Ctrl+click</span></div>
   <div data-dir="in">Add backlinks</div>
   <div class="sep"></div>
   <div id="ctx-remove">Remove node</div>
@@ -279,8 +400,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 var graphData = @@GRAPH_DATA@@;
 var TOKEN = @@TOKEN@@;
-var HELP = " — Double-click: open | Right-click: expand/remove | Space: freeze | Ctrl+F: search";
-var frozen = false;
+var VIEW = @@VIEW@@;  // {name, viewport, frozen, origin} of the view shown at start
+var HELP = " — Double-click: open | Ctrl+click: add outgoing | Right-click: expand/remove | Space: freeze | Ctrl+F: search | Ctrl+S: save view";
+var frozen = VIEW.frozen;
+var currentView = VIEW.name;  // null until the view is saved or a saved one is loaded
+var viewOrigin = VIEW.origin;
+var dirty = false;            // unsaved changes to the current view
 
 // Convert HTML title strings to DOM elements for rich tooltips
 function prepNode(n) {
@@ -320,6 +445,7 @@ var options = {
     smooth: { type: "continuous" },
   },
   physics: {
+    enabled: !frozen,
     solver: "forceAtlas2Based",
     forceAtlas2Based: {
       gravitationalConstant: -30,
@@ -328,7 +454,8 @@ var options = {
       springConstant: 0.02,
       damping: 0.4,
     },
-    stabilization: { iterations: 150 },
+    // Don't let the initial layout re-fit over a saved viewport
+    stabilization: { iterations: 150, fit: !VIEW.viewport },
   },
   interaction: {
     hover: true,
@@ -341,9 +468,22 @@ var options = {
 
 var network = new vis.Network(container, data, options);
 
+function applyViewport(vp) {
+  if (vp && isFinite(vp.scale) && isFinite(vp.x) && isFinite(vp.y)) {
+    network.moveTo({ position: { x: vp.x, y: vp.y }, scale: vp.scale });
+  } else {
+    network.fit();
+  }
+}
+if (VIEW.viewport) applyViewport(VIEW.viewport);
+
 function setInfo(msg) {
+  var view = currentView ? "View: " + currentView + (dirty ? "*" : "") + " | " : "";
   document.getElementById("info").textContent =
-    msg || ("Nodes: " + nodes.length + " | Edges: " + edges.length + HELP);
+    msg || (view + "Nodes: " + nodes.length + " | Edges: " + edges.length + HELP);
+}
+function markDirty() {
+  if (!dirty) { dirty = true; setInfo(); }
 }
 function showError(err) {
   setInfo("Error: " + err.message);
@@ -373,13 +513,16 @@ function removeNode(id) {
 
 // Freeze / unfreeze
 var btnFreeze = document.getElementById("btnFreeze");
-function toggleFreeze() {
-  frozen = !frozen;
+function setFrozen(f) {
+  frozen = f;
   network.setOptions({ physics: { enabled: !frozen } });
   btnFreeze.textContent = frozen ? "Unfreeze" : "Freeze";
   btnFreeze.classList.toggle("active", frozen);
 }
+function toggleFreeze() { setFrozen(!frozen); markDirty(); }
+setFrozen(frozen);
 btnFreeze.addEventListener("click", toggleFreeze);
+network.on("dragEnd", function(params) { if (params.nodes.length > 0) markDirty(); });
 
 document.addEventListener("keydown", function(e) {
   if (e.target.tagName === "INPUT") return;
@@ -404,6 +547,7 @@ function applySearch(q) {
 }
 document.addEventListener("keydown", function(e) {
   if (e.ctrlKey && e.key === "f") { e.preventDefault(); searchInput.focus(); searchInput.select(); }
+  if (e.ctrlKey && e.key === "s") { e.preventDefault(); saveView(); }
 });
 var searchTimer = null;
 searchInput.addEventListener("input", function() {
@@ -448,25 +592,47 @@ network.on("oncontext", function(params) {
 document.getElementById("ctx-remove").addEventListener("click", function() {
   if (!ctxNodeId) return;
   removeNode(ctxNodeId);
+  markDirty();
   setInfo();
   hideCtxMenu();
 });
+
+// Add the notes linked with `path` in `direction` ("both", "out" or "in")
+function expand(path, direction) {
+  setInfo("Loading linked notes…");
+  api("/neighbors", { path: path, direction: direction, shown: nodes.getIds() })
+    .then(function(result) {
+      var added = result.nodes.filter(function(n) { return !nodes.get(n.id); });
+      // Start new notes on a circle around the clicked one, so they don't pile
+      // up in the middle when the layout is frozen
+      var c = nodes.get(path) ? network.getPosition(path) : { x: 0, y: 0 };
+      added.forEach(function(n, i) {
+        var a = 2 * Math.PI * i / added.length;
+        n.x = c.x + 150 * Math.cos(a);
+        n.y = c.y + 150 * Math.sin(a);
+      });
+      nodes.add(added.map(prepNode));
+      // Edges among shown + new nodes; stale ones only for the clicked node
+      syncEdges(result.edges, function(e) { return e.from === path || e.to === path; });
+      if (added.length) markDirty();
+      setInfo();
+    })
+    .catch(showError);
+}
 
 ctxmenu.querySelectorAll("[data-dir]").forEach(function(item) {
   item.addEventListener("click", function() {
     if (!ctxNodeId) return;
     var path = ctxNodeId;
     hideCtxMenu();
-    setInfo("Loading linked notes…");
-    api("/neighbors", { path: path, direction: item.dataset.dir, shown: nodes.getIds() })
-      .then(function(result) {
-        nodes.add(result.nodes.filter(function(n) { return !nodes.get(n.id); }).map(prepNode));
-        // Edges among shown + new nodes; stale ones only for the clicked node
-        syncEdges(result.edges, function(e) { return e.from === path || e.to === path; });
-        setInfo();
-      })
-      .catch(showError);
+    expand(path, item.dataset.dir);
   });
+});
+
+// Ctrl+click (Cmd+click on macOS): add outgoing links
+network.on("click", function(params) {
+  var ev = params.event && params.event.srcEvent;
+  if (ev && (ev.ctrlKey || ev.metaKey) && params.nodes.length > 0) expand(params.nodes[0], "out");
 });
 
 // Refresh: re-read displayed nodes from disk, sync their edges
@@ -491,6 +657,80 @@ document.getElementById("btnRefresh").addEventListener("click", function() {
       btn.disabled = false;
     });
 });
+
+// Saved views
+var viewSelect = document.getElementById("viewSelect");
+
+function refreshViewList() {
+  return api("/views/list", {}).then(function(r) {
+    viewSelect.innerHTML = "";
+    var placeholder = new Option(r.views.length ? "Views…" : "No saved views", "");
+    placeholder.disabled = true;
+    viewSelect.add(placeholder);
+    r.views.forEach(function(v) {
+      viewSelect.add(new Option(v.name + " (" + v.count + ")", v.name));
+    });
+    viewSelect.value = currentView || "";
+  });
+}
+
+function saveView() {
+  var name = prompt("Save view as (letters, digits, _ . -):", currentView || "");
+  if (name === null) return;
+  name = name.trim();
+  if (!name) return;
+  var center = network.getViewPosition();
+  api("/views/save", {
+    name: name,
+    nodes: network.getPositions(),
+    viewport: { scale: network.getScale(), x: center.x, y: center.y },
+    frozen: frozen,
+    origin: viewOrigin
+  })
+    .then(function() {
+      currentView = name;
+      dirty = false;
+      setInfo();
+      return refreshViewList();
+    })
+    .catch(showError);
+}
+
+function loadView(name) {
+  if (dirty && !confirm("Discard unsaved changes to the current view?")) {
+    viewSelect.value = currentView || "";
+    return;
+  }
+  setInfo("Loading view " + name + "…");
+  api("/views/load", { name: name })
+    .then(function(v) {
+      setFrozen(v.frozen);  // before adding nodes, so a frozen view stays put
+      edges.clear();
+      nodes.clear();
+      nodes.add(v.graph.nodes.map(prepNode));
+      edges.add(v.graph.edges);
+      currentView = v.name;
+      viewOrigin = v.origin;
+      dirty = false;
+      searchInput.value = "";
+      applyViewport(v.viewport);
+      viewSelect.value = v.name;
+      if (v.missing) {
+        setInfo("View " + v.name + ": " + v.missing + " deleted note(s) dropped");
+        setTimeout(function() { setInfo(); }, 5000);
+      } else {
+        setInfo();
+      }
+    })
+    .catch(function(err) {
+      viewSelect.value = currentView || "";
+      showError(err);
+    });
+}
+
+viewSelect.addEventListener("change", function() { if (this.value) loadView(this.value); });
+document.getElementById("btnSave").addEventListener("click", saveView);
+refreshViewList().catch(showError);
 </script>
 </body>
 </html>"""
@@ -501,7 +741,7 @@ def script_json(obj):
     return json.dumps(obj).replace("</", "<\\/")
 
 
-def make_html(vis_data, token):
+def make_html(vis_data, token, state):
     legend_items = "\n".join(
         f'  <div><span style="background:{color}"></span>{html_mod.escape(tag)}</div>'
         for tag, color in TAG_COLORS.items()
@@ -511,6 +751,7 @@ def make_html(vis_data, token):
         "LEGEND_ITEMS": legend_items,
         "GRAPH_DATA": script_json(vis_data),
         "TOKEN": script_json(token),
+        "VIEW": script_json(state),
     }
     # Single pass, so substituted note content is never re-scanned for markers
     return re.sub(r"@@(\w+)@@", lambda m: subs[m.group(1)], HTML_TEMPLATE)
@@ -615,7 +856,20 @@ class GraphHandler(BaseHTTPRequestHandler):
                     body.get("path", ""), direction, set(body.get("shown", []))))
             if route == "/refresh":
                 return self._send_json(self._refresh(set(body.get("paths", []))))
-        except ZkError as e:
+            if route == "/views/list":
+                return self._send_json({"views": list_views()})
+            if route == "/views/load":
+                name = body.get("name")
+                view = read_view(name)
+                graph, missing = view_to_vis(view, *self.current())
+                return self._send_json({"graph": graph, "missing": missing, **view_state(view, name)})
+            if route == "/views/save":
+                name = body.get("name")
+                write_view(name, clean_view(body))
+                return self._send_json({"ok": True, "name": name})
+        except ViewError as e:
+            return self._send(400, str(e).encode())
+        except (ZkError, OSError) as e:
             return self._send(500, str(e).encode())
         self._send(404, b"not found")
 
@@ -646,9 +900,13 @@ def main():
     parser.add_argument("--depth", type=int, default=1, help="How many link hops from matched notes to include (default: 1)")
     parser.add_argument("--direction", choices=DIRECTIONS, default="both",
                         help="Which links --depth follows: out = notes they link to, in = backlinks (default: both)")
+    parser.add_argument("--view", help="Open a saved view (see --list-views) instead of filtering")
+    parser.add_argument("--list-views", action="store_true", help="List saved views and exit")
     parser.add_argument("--port", type=int, default=8089, help="HTTP port (default: 8089)")
     parser.add_argument("--no-open", action="store_true", help="Don't open a browser")
     args = parser.parse_args()
+    if args.view and (args.filter or args.filter_path):
+        parser.error("--view can't be combined with --filter/--filter-path")
 
     try:
         GraphHandler.vis_js = VIS_JS_PATH.read_bytes()
@@ -659,17 +917,35 @@ def main():
         notebook = Path(args.notebook).resolve() if args.notebook else find_notebook_dir(os.getcwd())
         NOTES_DIR = str(notebook)
         load_config(notebook)
+        if args.list_views:
+            views = list_views()
+            if not views:
+                print(f"No saved views in {VIEWS_DIR}")
+            for v in views:
+                print(f"{v['name']}\t{v['saved'] or '?'}\t{v['count']} notes")
+            return
+        view = read_view(args.view) if args.view else None
         print(f"Loading graph from zk notebook {NOTES_DIR}...")
         notes_by_path, links, adj = GraphHandler.reload()
-    except ZkError as e:
+    except (ZkError, ViewError) as e:
         sys.exit(str(e))
     print(f"Total: {len(notes_by_path)} notes, {len(links)} links")
 
-    data = {"notes": list(notes_by_path.values()), "links": links}
-    data = filter_graph(data, adj, args.filter, args.filter_path, args.depth, args.direction)
-    print(f"After filter: {len(data['notes'])} notes, {len(data['links'])} links")
-    if not data["notes"]:
-        print("Warning: no notes matched the filter", file=sys.stderr)
+    if view:
+        vis_data, missing = view_to_vis(view, notes_by_path, links, adj)
+        state = view_state(view, args.view)
+        print(f"View {args.view}: {len(vis_data['nodes'])} notes"
+              + (f" ({missing} deleted notes dropped)" if missing else ""))
+    else:
+        data = {"notes": list(notes_by_path.values()), "links": links}
+        data = filter_graph(data, adj, args.filter, args.filter_path, args.depth, args.direction)
+        print(f"After filter: {len(data['notes'])} notes, {len(data['links'])} links")
+        if not data["notes"]:
+            print("Warning: no notes matched the filter", file=sys.stderr)
+        vis_data = build_vis_data(data, adj)
+        origin = {"filter": args.filter, "filter_path": args.filter_path,
+                  "depth": args.depth, "direction": args.direction}
+        state = {"name": None, "viewport": None, "frozen": False, "origin": origin}
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), GraphHandler)
@@ -679,7 +955,7 @@ def main():
 
     GraphHandler.token = secrets.token_urlsafe(32)
     GraphHandler.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    GraphHandler.html_content = make_html(build_vis_data(data, adj), GraphHandler.token).encode()
+    GraphHandler.html_content = make_html(vis_data, GraphHandler.token, state).encode()
 
     url = f"http://127.0.0.1:{port}"
     print(f"Serving graph at {url}")
