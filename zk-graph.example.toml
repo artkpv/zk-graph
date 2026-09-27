@@ -1,0 +1,19 @@
+# Copy to <notebook>/.zk/zk-graph.toml
+
+# Command run when a note is double-clicked. No shell is involved.
+#   {path}      absolute path of the note (appended if not present)
+#   {notebook}  notebook directory
+# A string is split shell-style; a list is used as-is.
+open_cmd = ["kitty", "nvim", "{path}"]
+# open_cmd = "xdg-open"
+# open_cmd = ["code", "--goto", "{path}"]
+
+# Colour of notes without any tag listed below.
+default_color = "#97c2fc"
+
+# Tag -> colour. Order matters: the first tag listed here that a note has wins.
+[tag_colors]
+todo = "#e74c3c"
+draft = "#f39c12"
+idea = "#9b59b6"
+published = "#2ecc71"

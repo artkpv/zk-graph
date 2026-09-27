@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""Visualize a zk notebook's link graph in a web browser using vis-network.
+
+https://github.com/artkpv/zk-graph
+"""
+
+import argparse
+import hmac
+import html as html_mod
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import tomllib
+import urllib.parse
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VIS_JS_PATH = Path(__file__).resolve().parent / "vis-network.min.js"
+CONFIG_NAME = "zk-graph.toml"  # looked up in <notebook>/.zk/
+
+NOTES_DIR = "."  # set in main()
+# Order matters: the first tag listed here that a note has decides its colour.
+TAG_COLORS = {}
+DEFAULT_COLOR = "#97c2fc"
+OPEN_CMD = ["xdg-open", "{path}"]
+
+
+class ZkError(Exception):
+    pass
+
+
+def find_notebook_dir(start):
+    """Like zk: $ZK_NOTEBOOK_DIR, else the nearest parent directory with a .zk/."""
+    env = os.environ.get("ZK_NOTEBOOK_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    start = Path(start).resolve()
+    for d in (start, *start.parents):
+        if (d / ".zk").is_dir():
+            return d
+    raise ZkError(f"No zk notebook found at or above {start} (and ZK_NOTEBOOK_DIR is unset)")
+
+
+def load_config(notebook):
+    """Apply <notebook>/.zk/zk-graph.toml, if present, to the module settings."""
+    global TAG_COLORS, DEFAULT_COLOR, OPEN_CMD
+    path = notebook / ".zk" / CONFIG_NAME
+    if not path.is_file():
+        return
+    try:
+        cfg = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ZkError(f"Cannot read {path}: {e}")
+    TAG_COLORS = dict(cfg.get("tag_colors", TAG_COLORS))
+    DEFAULT_COLOR = cfg.get("default_color", DEFAULT_COLOR)
+    open_cmd = cfg.get("open_cmd", OPEN_CMD)
+    OPEN_CMD = shlex.split(open_cmd) if isinstance(open_cmd, str) else list(open_cmd)
+
+
+def get_graph_json():
+    try:
+        result = subprocess.run(
+            ["zk", "--notebook-dir", NOTES_DIR, "graph", "-f", "json", "-q"],
+            capture_output=True, text=True, cwd=NOTES_DIR,
+        )
+    except FileNotFoundError:
+        raise ZkError("zk not found in PATH")
+    if result.returncode != 0:
+        raise ZkError(f"zk graph failed: {result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except ValueError as e:
+        raise ZkError(f"zk graph returned invalid JSON: {e}")
+
+
+def filter_graph(data, filter_str, filter_path, depth=1):
+    notes_by_path = {n["path"]: n for n in data["notes"]}
+
+    if filter_str or filter_path:
+        matched = set()
+        for n in data["notes"]:
+            path = n["path"]
+            if filter_path and not path.startswith(filter_path):
+                continue
+            if filter_str:
+                searchable = (n.get("title") or "") + " " + (n.get("lead") or "") + " " + path
+                if filter_str.lower() not in searchable.lower():
+                    continue
+            matched.add(path)
+
+        # Build adjacency from links
+        neighbors = {}
+        for link in data["links"]:
+            src = link.get("sourcePath", "")
+            tgt = link.get("targetPath", "")
+            if src in notes_by_path and tgt in notes_by_path:
+                neighbors.setdefault(src, set()).add(tgt)
+                neighbors.setdefault(tgt, set()).add(src)
+
+        # BFS expansion to depth
+        included = set(matched)
+        frontier = set(matched)
+        for _ in range(depth):
+            next_frontier = set()
+            for node in frontier:
+                for nb in neighbors.get(node, []):
+                    if nb not in included:
+                        next_frontier.add(nb)
+            included |= next_frontier
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        data["notes"] = [n for n in data["notes"] if n["path"] in included]
+        data["links"] = [
+            l for l in data["links"]
+            if l.get("sourcePath", "") in included and l.get("targetPath", "") in included
+        ]
+
+    return data
+
+
+def note_to_vis_node(n):
+    label = n.get("title") or n.get("lead") or n.get("filenameStem") or n["path"]
+    if len(label) > 60:
+        label = label[:57] + "..."
+    tags = n.get("tags") or []
+    color = next((c for t, c in TAG_COLORS.items() if t in tags), DEFAULT_COLOR)
+    tags_str = ", ".join(tags)
+    body = (n.get("body") or "").strip()
+    preview_lines = body.split("\n")[:8]
+    preview = html_mod.escape("\n".join(preview_lines))
+    tooltip = f"<b>{html_mod.escape(label)}</b>"
+    if tags_str:
+        tooltip += f"<br><i>{html_mod.escape(tags_str)}</i>"
+    if preview:
+        tooltip += f"<hr style='margin:4px 0;border-color:#555'><pre style='margin:0;white-space:pre-wrap'>{preview}</pre>"
+    return {"id": n["path"], "label": label, "color": color, "title": tooltip}
+
+
+def vis_edges(links, allowed):
+    """Unique, non-self edges whose both endpoints are in `allowed`."""
+    seen = set()
+    edges = []
+    for link in links:
+        src = link.get("sourcePath")
+        tgt = link.get("targetPath")
+        if not src or not tgt or src == tgt or (src, tgt) in seen:
+            continue
+        if src not in allowed or tgt not in allowed:
+            continue
+        seen.add((src, tgt))
+        edges.append({"id": f"{src}\n{tgt}", "from": src, "to": tgt})
+    return edges
+
+
+def build_vis_data(data):
+    nodes = [note_to_vis_node(n) for n in data["notes"]]
+    edges = vis_edges(data["links"], {n["path"] for n in data["notes"]})
+    return {"nodes": nodes, "edges": edges}
+
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ZK Graph</title>
+<script src="/vis-network.min.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; font-family: sans-serif; background: #1e1e1e; }
+  #graph { width: 100vw; height: 100vh; }
+  #legend {
+    position: absolute; top: 10px; right: 10px; background: rgba(30,30,30,0.9);
+    color: #ccc; padding: 10px; border-radius: 6px; font-size: 13px;
+  }
+  #legend div { margin: 3px 0; }
+  #legend span { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+    vertical-align: middle; margin-right: 6px; }
+  #toolbar {
+    position: absolute; top: 10px; left: 10px; display: flex; gap: 6px;
+  }
+  #toolbar button, #toolbar input {
+    background: rgba(30,30,30,0.9); color: #ccc; border: 1px solid #555;
+    padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px;
+  }
+  #toolbar button:hover { background: rgba(60,60,60,0.9); }
+  #toolbar button.active { background: #e74c3c; color: #fff; border-color: #e74c3c; }
+  #toolbar input { width: 180px; cursor: text; }
+  #info {
+    position: absolute; bottom: 10px; left: 10px; background: rgba(30,30,30,0.9);
+    color: #ccc; padding: 8px 12px; border-radius: 6px; font-size: 13px;
+  }
+  #ctxmenu {
+    display: none; position: absolute; background: #2a2a2a; border: 1px solid #555;
+    border-radius: 4px; padding: 4px 0; z-index: 1000; min-width: 160px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  #ctxmenu div {
+    padding: 6px 14px; color: #ccc; cursor: pointer; font-size: 13px;
+  }
+  #ctxmenu div:hover { background: #3a3a3a; }
+  #ctxmenu div.sep { border-top: 1px solid #444; margin: 2px 0; padding: 0; cursor: default; }
+</style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="toolbar">
+  <button id="btnRefresh">Refresh</button>
+  <button id="btnFreeze" title="Space to toggle">Freeze</button>
+  <button id="btnFit">Fit</button>
+  <input id="search" type="text" placeholder="Search nodes..." title="Ctrl+F">
+</div>
+<div id="legend">
+  <div><span style="background:@@DEFAULT_COLOR@@"></span>No tag</div>
+@@LEGEND_ITEMS@@
+</div>
+<div id="info"></div>
+<div id="ctxmenu">
+  <div id="ctx-add">Add linked nodes</div>
+  <div class="sep"></div>
+  <div id="ctx-remove">Remove node</div>
+</div>
+<script>
+var graphData = @@GRAPH_DATA@@;
+var TOKEN = @@TOKEN@@;
+var HELP = " — Double-click: open | Right-click: add/remove | Space: freeze | Ctrl+F: search";
+var frozen = false;
+
+// Convert HTML title strings to DOM elements for rich tooltips
+function prepNode(n) {
+  var div = document.createElement("div");
+  div.style.cssText = "background:#2a2a2a;color:#ccc;padding:12px 14px;border-radius:4px;max-width:600px;font-size:14px;line-height:1.5";
+  div.innerHTML = n.title;
+  n.title = div;
+  return n;
+}
+
+function api(route, payload) {
+  return fetch(route, {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Token": TOKEN},
+    body: JSON.stringify(payload)
+  }).then(function(r) {
+    if (!r.ok) return r.text().then(function(t) { throw new Error(t || r.status); });
+    return r.json();
+  });
+}
+
+var nodes = new vis.DataSet(graphData.nodes.map(prepNode));
+var edges = new vis.DataSet(graphData.edges);
+
+var container = document.getElementById("graph");
+var data = { nodes: nodes, edges: edges };
+var options = {
+  nodes: {
+    shape: "dot",
+    size: 10,
+    font: { color: "#ccc", size: 11 },
+    borderWidth: 1,
+  },
+  edges: {
+    color: { color: "#555", highlight: "#aaa" },
+    arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+    smooth: { type: "continuous" },
+  },
+  physics: {
+    solver: "forceAtlas2Based",
+    forceAtlas2Based: {
+      gravitationalConstant: -30,
+      centralGravity: 0.005,
+      springLength: 100,
+      springConstant: 0.02,
+      damping: 0.4,
+    },
+    stabilization: { iterations: 150 },
+  },
+  interaction: {
+    hover: true,
+    tooltipDelay: 100,
+    navigationButtons: true,
+    keyboard: { enabled: true, bindToWindow: false },
+  },
+  layout: { improvedLayout: false },
+};
+
+var network = new vis.Network(container, data, options);
+
+function setInfo(msg) {
+  document.getElementById("info").textContent =
+    msg || ("Nodes: " + nodes.length + " | Edges: " + edges.length + HELP);
+}
+function showError(err) {
+  setInfo("Error: " + err.message);
+  setTimeout(function() { setInfo(); }, 5000);
+}
+setInfo();
+
+// Add fresh edges whose endpoints are displayed; drop displayed edges that
+// isStale() claims for this sync but that are absent from the fresh set.
+function syncEdges(fresh, isStale) {
+  var freshIds = new Set();
+  var toAdd = [];
+  fresh.forEach(function(e) {
+    freshIds.add(e.id);
+    if (!edges.get(e.id) && nodes.get(e.from) && nodes.get(e.to)) toAdd.push(e);
+  });
+  edges.add(toAdd);
+  edges.remove(edges.getIds({
+    filter: function(e) { return isStale(e) && !freshIds.has(e.id); }
+  }));
+}
+
+function removeNode(id) {
+  edges.remove(edges.getIds({ filter: function(e) { return e.from === id || e.to === id; } }));
+  nodes.remove(id);
+}
+
+// Freeze / unfreeze
+var btnFreeze = document.getElementById("btnFreeze");
+function toggleFreeze() {
+  frozen = !frozen;
+  network.setOptions({ physics: { enabled: !frozen } });
+  btnFreeze.textContent = frozen ? "Unfreeze" : "Freeze";
+  btnFreeze.classList.toggle("active", frozen);
+}
+btnFreeze.addEventListener("click", toggleFreeze);
+
+document.addEventListener("keydown", function(e) {
+  if (e.target.tagName === "INPUT") return;
+  if (e.code === "Space") { e.preventDefault(); toggleFreeze(); }
+});
+
+// Fit
+document.getElementById("btnFit").addEventListener("click", function() {
+  network.fit({ animation: { duration: 500, easingFunction: "easeInOutQuad" } });
+});
+
+// Search
+var searchInput = document.getElementById("search");
+function matches(n, q) {
+  return n.label.toLowerCase().includes(q) || n.id.toLowerCase().includes(q);
+}
+function applySearch(q) {
+  nodes.update(nodes.get().map(function(n) {
+    var m = !q || matches(n, q);
+    return { id: n.id, opacity: m ? 1 : 0.1, font: { color: !q ? "#ccc" : m ? "#fff" : "#333" } };
+  }));
+}
+document.addEventListener("keydown", function(e) {
+  if (e.ctrlKey && e.key === "f") { e.preventDefault(); searchInput.focus(); searchInput.select(); }
+});
+var searchTimer = null;
+searchInput.addEventListener("input", function() {
+  clearTimeout(searchTimer);
+  var q = this.value.toLowerCase();
+  searchTimer = setTimeout(function() { applySearch(q); }, 400);
+});
+searchInput.addEventListener("keydown", function(e) {
+  if (e.key === "Escape") { this.value = ""; this.dispatchEvent(new Event("input")); this.blur(); }
+  if (e.key === "Enter") {
+    var q = this.value.toLowerCase();
+    var found = nodes.get({ filter: function(n) { return matches(n, q); } })[0];
+    if (found) { network.focus(found.id, { scale: 1.5, animation: { duration: 500 } }); network.selectNodes([found.id]); }
+  }
+});
+
+// Double-click to open
+network.on("doubleClick", function(params) {
+  if (params.nodes.length > 0) {
+    api("/open", { path: params.nodes[0] }).catch(showError);
+  }
+});
+
+// Context menu
+var ctxmenu = document.getElementById("ctxmenu");
+var ctxNodeId = null;
+
+function hideCtxMenu() { ctxmenu.style.display = "none"; ctxNodeId = null; }
+document.addEventListener("click", hideCtxMenu);
+document.addEventListener("keydown", function(e) { if (e.key === "Escape") hideCtxMenu(); });
+
+network.on("oncontext", function(params) {
+  params.event.preventDefault();
+  var nodeId = network.getNodeAt(params.pointer.DOM);
+  if (!nodeId) { hideCtxMenu(); return; }
+  ctxNodeId = nodeId;
+  ctxmenu.style.left = params.event.pageX + "px";
+  ctxmenu.style.top = params.event.pageY + "px";
+  ctxmenu.style.display = "block";
+});
+
+document.getElementById("ctx-remove").addEventListener("click", function() {
+  if (!ctxNodeId) return;
+  removeNode(ctxNodeId);
+  setInfo();
+  hideCtxMenu();
+});
+
+document.getElementById("ctx-add").addEventListener("click", function() {
+  if (!ctxNodeId) return;
+  var path = ctxNodeId;
+  hideCtxMenu();
+  api("/neighbors", { path: path, shown: nodes.getIds() })
+    .then(function(result) {
+      nodes.add(result.nodes.filter(function(n) { return !nodes.get(n.id); }).map(prepNode));
+      // Edges among shown + new nodes; stale ones only for the clicked node
+      syncEdges(result.edges, function(e) { return e.from === path || e.to === path; });
+      setInfo();
+    })
+    .catch(showError);
+});
+
+// Refresh: re-read displayed nodes from disk, sync their edges
+document.getElementById("btnRefresh").addEventListener("click", function() {
+  var btn = this;
+  btn.textContent = "Refreshing...";
+  btn.disabled = true;
+  var displayedPaths = nodes.getIds();
+  api("/refresh", { paths: displayedPaths })
+    .then(function(result) {
+      // Update node content (tooltips, labels, colors)
+      nodes.update(result.nodes.map(prepNode));
+      // Remove nodes that no longer exist on disk
+      var freshIds = new Set(result.nodes.map(function(n) { return n.id; }));
+      displayedPaths.forEach(function(id) { if (!freshIds.has(id)) removeNode(id); });
+      syncEdges(result.edges, function() { return true; });
+      setInfo();
+    })
+    .catch(showError)
+    .finally(function() {
+      btn.textContent = "Refresh";
+      btn.disabled = false;
+    });
+});
+</script>
+</body>
+</html>"""
+
+
+def script_json(obj):
+    """JSON safe to embed inside a <script> block."""
+    return json.dumps(obj).replace("</", "<\\/")
+
+
+def make_html(vis_data, token):
+    legend_items = "\n".join(
+        f'  <div><span style="background:{color}"></span>{html_mod.escape(tag)}</div>'
+        for tag, color in TAG_COLORS.items()
+    )
+    subs = {
+        "DEFAULT_COLOR": DEFAULT_COLOR,
+        "LEGEND_ITEMS": legend_items,
+        "GRAPH_DATA": script_json(vis_data),
+        "TOKEN": script_json(token),
+    }
+    # Single pass, so substituted note content is never re-scanned for markers
+    return re.sub(r"@@(\w+)@@", lambda m: subs[m.group(1)], HTML_TEMPLATE)
+
+
+def open_note(path):
+    """Run OPEN_CMD with {path}/{notebook} filled in; path is appended if absent."""
+    fields = {"path": os.path.join(NOTES_DIR, path), "notebook": NOTES_DIR}
+    # Plain str.replace per argument: no shell, so note paths can't inject commands
+    cmd = [arg.replace("{path}", fields["path"]).replace("{notebook}", fields["notebook"])
+           for arg in OPEN_CMD]
+    if not any("{path}" in arg for arg in OPEN_CMD):
+        cmd.append(fields["path"])
+    subprocess.Popen(
+        cmd, cwd=NOTES_DIR, start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+class GraphHandler(BaseHTTPRequestHandler):
+    html_content = b""
+    vis_js = b""
+    token = ""
+    allowed_hosts = set()
+    notes_by_path = {}  # all notes keyed by path
+    links = []          # all links from zk
+
+    @classmethod
+    def reload(cls):
+        fresh = get_graph_json()
+        notes_by_path = {n["path"]: n for n in fresh["notes"]}
+        cls.notes_by_path, cls.links = notes_by_path, fresh["links"]
+        return notes_by_path, fresh["links"]
+
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, obj):
+        self._send(200, json.dumps(obj).encode(), "application/json; charset=utf-8")
+
+    def _host_ok(self):
+        # Blocks DNS-rebinding: only our own origin names are accepted
+        return self.headers.get("Host", "") in self.allowed_hosts
+
+    def do_GET(self):
+        if not self._host_ok():
+            return self._send(403, b"forbidden")
+        route = urllib.parse.urlparse(self.path).path
+        if route == "/":
+            return self._send(200, self.html_content, "text/html; charset=utf-8")
+        if route == "/vis-network.min.js":
+            return self._send(200, self.vis_js, "text/javascript; charset=utf-8")
+        self._send(404, b"not found")
+
+    def do_POST(self):
+        # The custom X-Token header forces a CORS preflight, which we never
+        # answer, so other sites can't trigger these endpoints.
+        token = self.headers.get("X-Token", "")
+        if not self._host_ok() or not hmac.compare_digest(token.encode(), self.token.encode()):
+            return self._send(403, b"forbidden")
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._send(400, b"bad json")
+
+        route = urllib.parse.urlparse(self.path).path
+        try:
+            if route == "/open":
+                path = body.get("path", "")
+                if path not in self.notes_by_path:
+                    return self._send(404, b"unknown note")
+                try:
+                    open_note(path)
+                except OSError as e:
+                    return self._send(500, f"open_cmd failed: {e}".encode())
+                return self._send_json({"ok": True})
+            if route == "/neighbors":
+                return self._send_json(self._neighbors(body.get("path", ""), set(body.get("shown", []))))
+            if route == "/refresh":
+                return self._send_json(self._refresh(set(body.get("paths", []))))
+        except ZkError as e:
+            return self._send(500, str(e).encode())
+        self._send(404, b"not found")
+
+    def _refresh(self, paths):
+        """Re-read zk graph from disk, return updated nodes and valid edges for given paths."""
+        notes_by_path, links = self.reload()
+        vis_nodes = [note_to_vis_node(notes_by_path[p]) for p in paths if p in notes_by_path]
+        return {"nodes": vis_nodes, "edges": vis_edges(links, paths)}
+
+    def _neighbors(self, path, shown):
+        """Re-read graph from disk, return neighbors of path + edges among shown and new nodes."""
+        notes_by_path, links = self.reload()
+        neighbor_paths = set()
+        for link in links:
+            src = link.get("sourcePath", "")
+            tgt = link.get("targetPath", "")
+            if src == path and tgt in notes_by_path:
+                neighbor_paths.add(tgt)
+            elif tgt == path and src in notes_by_path:
+                neighbor_paths.add(src)
+        neighbor_paths.discard(path)
+        vis_nodes = [note_to_vis_node(notes_by_path[p]) for p in neighbor_paths]
+        return {"nodes": vis_nodes, "edges": vis_edges(links, shown | neighbor_paths | {path})}
+
+    def log_message(self, format, *args):
+        pass  # silence logs
+
+
+def main():
+    global NOTES_DIR
+    parser = argparse.ArgumentParser(description="Visualize a zk notebook's link graph in the browser")
+    parser.add_argument("--notebook", help="Notebook directory (default: $ZK_NOTEBOOK_DIR or nearest parent with .zk/)")
+    parser.add_argument("--filter", default="", help="Filter notes by search string")
+    parser.add_argument("--filter-path", default="", help="Filter notes by path prefix")
+    parser.add_argument("--depth", type=int, default=1, help="How many link hops from matched notes to include (default: 1)")
+    parser.add_argument("--port", type=int, default=8089, help="HTTP port (default: 8089)")
+    parser.add_argument("--no-open", action="store_true", help="Don't open a browser")
+    args = parser.parse_args()
+
+    try:
+        GraphHandler.vis_js = VIS_JS_PATH.read_bytes()
+    except OSError as e:
+        sys.exit(f"Cannot read {VIS_JS_PATH}: {e.strerror}")
+
+    try:
+        notebook = Path(args.notebook).resolve() if args.notebook else find_notebook_dir(os.getcwd())
+        NOTES_DIR = str(notebook)
+        load_config(notebook)
+        print(f"Loading graph from zk notebook {NOTES_DIR}...")
+        notes_by_path, links = GraphHandler.reload()
+    except ZkError as e:
+        sys.exit(str(e))
+    print(f"Total: {len(notes_by_path)} notes, {len(links)} links")
+
+    data = {"notes": list(notes_by_path.values()), "links": links}
+    data = filter_graph(data, args.filter, args.filter_path, args.depth)
+    print(f"After filter: {len(data['notes'])} notes, {len(data['links'])} links")
+    if not data["notes"]:
+        print("Warning: no notes matched the filter", file=sys.stderr)
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), GraphHandler)
+    except OSError as e:
+        sys.exit(f"Cannot bind 127.0.0.1:{args.port}: {e.strerror}. Try another --port.")
+    port = server.server_address[1]
+
+    GraphHandler.token = secrets.token_urlsafe(32)
+    GraphHandler.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    GraphHandler.html_content = make_html(build_vis_data(data), GraphHandler.token).encode()
+
+    url = f"http://127.0.0.1:{port}"
+    print(f"Serving graph at {url}")
+    if not args.no_open:
+        webbrowser.open(url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
