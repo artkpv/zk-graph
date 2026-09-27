@@ -262,20 +262,21 @@ def vis_node(note, graph, config):
     full = note.get("title") or note.get("lead") or note.get("filenameStem") or path
     tags = note.get("tags") or []
     preview = "\n".join((note.get("body") or "").strip().split("\n")[:8])
-    tooltip = f"<b>{html.escape(full)}</b>"
+    # HTML for the popup shown on clicking the note. Not called "title": vis
+    # would show that as a hover tooltip.
+    details = f"<b>{html.escape(full)}</b>"
     if tags:
-        tooltip += f"<br><i>{html.escape(', '.join(tags))}</i>"
-    tooltip += (f"<br><small>{len(graph.linked(path, 'out'))} outgoing · "
+        details += f"<br><i>{html.escape(', '.join(tags))}</i>"
+    details += (f"<br><small>{len(graph.linked(path, 'out'))} outgoing · "
                 f"{len(graph.linked(path, 'in'))} backlinks</small>")
     if preview:
-        tooltip += (f"<hr style='margin:4px 0;border-color:#555'>"
-                    f"<pre style='margin:0;white-space:pre-wrap'>{html.escape(preview)}</pre>")
+        details += f"<hr><pre>{html.escape(preview)}</pre>"
     return {
         "id": path,
         "label": short_label(full),
         "full": full,  # for search, which should also match the part cut from the label
         "color": config.note_color(path, tags),
-        "title": tooltip,
+        "details": details,
         # Size by log of distinct linked notes over the whole notebook, so a few
         # hubs don't shrink everything else to the minimum.
         "value": round(math.log2(len(graph.linked(path)) + 1), 3),

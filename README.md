@@ -8,7 +8,7 @@ A Python script (standard library only) runs `zk graph` and serves the result on
 
 - Force-directed graph of all notes and links, or only the part around a search term or path prefix.
 - Node size grows (logarithmically) with the number of distinct notes a note is linked with, so hubs stand out.
-- Hover a note to see its title, tags, outgoing/backlink counts and the first lines of its body.
+- **Click** a note to see its full title, tags, outgoing/backlink counts and the first lines of its body in a popup. The popup closes when you click empty space, press **Esc**, or pan or zoom the graph.
 - **Readable labels**: a label shows only the part of the title before " — " (so "Concept — definition" shows "Concept"), wraps instead of running long, and has a dark outline so edges don't cut through it. Search still matches the full title.
 - **Focus**: hovering a note dims everything except it and its linked notes, and shows their labels at full size. **Click** a note to keep that focus; click empty space to clear it.
 - **Label modes** (**L** or the *Labels* button): *hubs* sizes labels by the note's link count and hides small ones when zoomed out; *all* shows every label at one size; *none* shows labels only for the focused note and its links. The choice is remembered in the browser.

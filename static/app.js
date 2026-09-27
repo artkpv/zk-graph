@@ -10,7 +10,7 @@
 
 // ---- Constants ------------------------------------------------------------
 
-const HELP = " — Click: focus | Double-click: open | Ctrl+click: add outgoing | " +
+const HELP = " — Click: details + focus | Double-click: open | Ctrl+click: add outgoing | " +
   "Right-click: expand/remove | Space: freeze | L: labels | Ctrl+F: search | Ctrl+S: save view";
 const LABEL_MODES = ["hubs", "all", "none"];
 const LABEL_SIZE = 12;
@@ -111,18 +111,10 @@ function markDirty() {
 
 // A per-node `scaling.label` replaces the global one wholesale, so it must
 // always carry every field; a bare {enabled} leaves the label size null.
-function labelScaling(enabled) {
-  return { enabled, min: 10, max: 22, drawThreshold: 9, maxVisible: 26 };
-}
-
-// The server sends tooltips as HTML strings; vis shows them as text unless
-// given an element.
-function prepNode(n) {
-  const div = document.createElement("div");
-  div.className = "note-tooltip";
-  div.innerHTML = n.title;
-  n.title = div;
-  return n;
+// `alwaysDraw` drops the threshold below which small labels aren't drawn,
+// without changing the label's size.
+function labelScaling(enabled, alwaysDraw = false) {
+  return { enabled, min: 10, max: 22, drawThreshold: alwaysDraw ? 0 : 9, maxVisible: 26 };
 }
 
 function networkOptions(view) {
@@ -157,7 +149,6 @@ function networkOptions(view) {
     },
     interaction: {
       hover: true,
-      tooltipDelay: 100,
       navigationButtons: true,
       keyboard: { enabled: true, bindToWindow: false },
     },
@@ -166,7 +157,7 @@ function networkOptions(view) {
 }
 
 function createNetwork(graph, view) {
-  nodes = new vis.DataSet(graph.nodes.map(prepNode));
+  nodes = new vis.DataSet(graph.nodes);
   edges = new vis.DataSet(graph.edges);
   network = new vis.Network($("graph"), { nodes, edges }, networkOptions(view));
   if (view.viewport) applyViewport(view.viewport);
@@ -250,7 +241,8 @@ function applyStyles() {
     const hit = !q || matches(n, q);
     const inFocus = !focus || focus.has(n.id);
     const lit = hit && inFocus;
-    // Focused notes always get a full-size label; the rest follow the label mode
+    // Focused notes always show their label, at the same size as unfocused
+    // (so hovering doesn't resize it), even if too small to draw otherwise
     const showLabel = lit && (focus ? true : labelMode !== "none");
     return {
       id: n.id,
@@ -260,7 +252,7 @@ function applyStyles() {
         strokeWidth: showLabel ? 3 : 0,
         size: LABEL_SIZE,
       },
-      scaling: { label: labelScaling(labelMode === "hubs" && !(focus && inFocus)) },
+      scaling: { label: labelScaling(labelMode === "hubs", Boolean(focus && inFocus)) },
     };
   }));
 
@@ -295,6 +287,7 @@ function removeNode(id) {
   nodes.remove(id);
   if (selectedId === id) selectedId = null;
   if (hoverId === id) hoverId = null;
+  if (popupNodeId === id) hidePopup();
 }
 
 // Add fresh edges whose endpoints are displayed; drop displayed edges that
@@ -324,7 +317,7 @@ async function expand(path, direction) {
     const result = await api("/neighbors", { path, direction, shown: nodes.getIds() }, label);
     const added = result.nodes.filter((n) => !nodes.get(n.id));
     placeAround(path, added);
-    nodes.add(added.map(prepNode));
+    nodes.add(added);
     // Edges among shown + new nodes; stale ones only for the clicked node
     syncEdges(result.edges, (e) => e.from === path || e.to === path);
     applyStyles();
@@ -348,7 +341,8 @@ async function refresh() {
   const displayed = nodes.getIds();
   try {
     const result = await api("/refresh", { paths: displayed }, "Refreshing notes…");
-    nodes.update(result.nodes.map(prepNode));
+    nodes.update(result.nodes);
+    if (popupNodeId && nodes.get(popupNodeId)) $("popup").innerHTML = nodes.get(popupNodeId).details;
     const fresh = new Set(result.nodes.map((n) => n.id));
     displayed.filter((id) => !fresh.has(id)).forEach(removeNode);
     syncEdges(result.edges, () => true);
@@ -404,7 +398,7 @@ async function loadView(name) {
     setFrozen(v.frozen);  // before adding nodes, so a frozen view stays put
     edges.clear();
     nodes.clear();
-    nodes.add(v.graph.nodes.map(prepNode));
+    nodes.add(v.graph.nodes);
     edges.add(v.graph.edges);
     currentView = v.name;
     viewOrigin = v.origin;
@@ -412,6 +406,7 @@ async function loadView(name) {
     $("search").value = "";
     searchQuery = "";
     selectedId = hoverId = null;
+    hidePopup();
     applyStyles();
     applyViewport(v.viewport);
     $("viewSelect").value = v.name;
@@ -424,6 +419,30 @@ async function loadView(name) {
 }
 
 // ---- UI wiring ----------------------------------------------------------------
+
+let popupNodeId = null;  // note whose details the popup shows
+
+// Show a note's details next to `at` (px in the page), kept inside the window.
+function showPopup(id, at) {
+  const node = nodes.get(id);
+  if (!node) return hidePopup();
+  const popup = $("popup");
+  popup.innerHTML = node.details;  // built and escaped by the server
+  popup.style.display = "block";
+  popup.scrollTop = 0;
+  popupNodeId = id;
+  const margin = 10, gap = 16;
+  let x = at.x + gap, y = at.y + gap;
+  if (x + popup.offsetWidth > innerWidth - margin) x = Math.max(margin, at.x - gap - popup.offsetWidth);
+  if (y + popup.offsetHeight > innerHeight - margin) y = Math.max(margin, innerHeight - margin - popup.offsetHeight);
+  popup.style.left = x + "px";
+  popup.style.top = y + "px";
+}
+
+function hidePopup() {
+  $("popup").style.display = "none";
+  popupNodeId = null;
+}
 
 let ctxNodeId = null;  // note the context menu was opened on
 
@@ -476,7 +495,7 @@ function wireSearch() {
 
 function wireKeyboard() {
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") hideCtxMenu();
+    if (e.key === "Escape") { hideCtxMenu(); hidePopup(); }
     if (e.ctrlKey || e.metaKey) {
       if (e.key === "f") { e.preventDefault(); $("search").focus(); $("search").select(); }
       if (e.key === "s") { e.preventDefault(); saveView(); }
@@ -512,11 +531,22 @@ function wireNetwork() {
   network.on("doubleClick", (p) => {
     if (p.nodes.length) api("/open", { path: p.nodes[0] }).catch(showError);
   });
-  // Ctrl+click (Cmd+click on macOS): add outgoing links
+  // Click: show the note's details; Ctrl+click (Cmd+click on macOS): add outgoing links
   network.on("click", (p) => {
     const ev = p.event && p.event.srcEvent;
-    if (ev && (ev.ctrlKey || ev.metaKey) && p.nodes.length) expand(p.nodes[0], "out");
+    const id = p.nodes[0];
+    if (id && ev && (ev.ctrlKey || ev.metaKey)) {
+      hidePopup();
+      expand(id, "out");
+    } else if (id) {
+      showPopup(id, p.pointer.DOM);
+    } else {
+      hidePopup();
+    }
   });
+  // The popup doesn't follow the graph, so close it when the graph moves
+  network.on("dragStart", hidePopup);
+  network.on("zoom", hidePopup);
   network.on("oncontext", (p) => {
     p.event.preventDefault();
     const nodeId = network.getNodeAt(p.pointer.DOM);

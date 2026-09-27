@@ -38,11 +38,16 @@ body { margin: 0; overflow: hidden; font-family: sans-serif; background: #1e1e1e
 #ctxmenu div.sep { border-top: 1px solid #444; margin: 2px 0; padding: 0; cursor: default; }
 #ctxmenu .key { float: right; margin-left: 16px; color: #777; }
 
-/* Tooltip shown on hovering a note (vis puts our element inside its own) */
-.note-tooltip {
-  background: #2a2a2a; color: #ccc; padding: 12px 14px; border-radius: 4px;
-  max-width: 600px; font-size: 14px; line-height: 1.5;
+/* Popup with a note's details, shown on clicking the note */
+#popup {
+  display: none; position: absolute; z-index: 950; box-sizing: border-box;
+  max-width: min(600px, calc(100vw - 20px)); max-height: 60vh; overflow: auto;
+  background: #2a2a2a; color: #ccc; border: 1px solid #555; border-radius: 4px;
+  padding: 12px 14px; font-size: 14px; line-height: 1.5;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
 }
+#popup hr { margin: 4px 0; border: 0; border-top: 1px solid #555; }
+#popup pre { margin: 0; white-space: pre-wrap; }
 
 /* Busy indicator: shown while a request runs longer than a moment */
 #busy {
