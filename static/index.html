@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ZK Graph</title>
+<link rel="stylesheet" href="style.css">
+<script src="vis-network.min.js"></script>
+</head>
+<body>
+<div id="graph"></div>
+
+<div id="toolbar">
+  <button id="btnRefresh">Refresh</button>
+  <button id="btnFreeze" title="Space to toggle">Freeze</button>
+  <button id="btnFit">Fit</button>
+  <button id="btnLabels" title="L to cycle: hubs = size by links, small ones hidden when zoomed out">Labels: hubs</button>
+  <input id="search" type="text" placeholder="Search nodes..." title="Ctrl+F">
+  <select id="viewSelect" title="Switch to a saved view"></select>
+  <button id="btnSave" title="Ctrl+S">Save view</button>
+</div>
+
+<div id="legend"></div>
+<div id="info"></div>
+
+<div id="busybar"></div>
+<div id="busy"><span class="spinner"></span><span id="busyText"></span></div>
+
+<div id="ctxmenu">
+  <div data-dir="both">Add all linked notes</div>
+  <div data-dir="out">Add outgoing links <span class="key">Ctrl+click</span></div>
+  <div data-dir="in">Add backlinks</div>
+  <div class="sep"></div>
+  <div id="ctxRemove">Remove node</div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

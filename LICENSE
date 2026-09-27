@@ -22,6 +22,6 @@ SOFTWARE.
 
 ---
 
-vis-network.min.js is a third-party file (https://github.com/visjs/vis-network),
+static/vis-network.min.js is a third-party file (https://github.com/visjs/vis-network),
 copyright (c) 2011-2017 Almende B.V. and (c) 2017-2019 visjs contributors, dual-licensed under
 the Apache License 2.0 and the MIT License. See the header of that file.

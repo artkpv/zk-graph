@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Visualize a zk notebook's link graph in a web browser using vis-network.
 
+This script loads the graph with `zk graph`, keeps it cached in memory, and
+serves the page in static/ plus a small JSON API on 127.0.0.1:
+
+    GET  /init             the graph to show at start, the API token, the legend
+    POST /open             open a note in the editor (config: open_cmd)
+    POST /neighbors        a note's linked notes, for expanding the graph
+    POST /refresh          fresh content and links for the displayed notes
+    POST /views/list|load|save   saved views
+
 https://github.com/artkpv/zk-graph
 """
 
 import argparse
 import hmac
-import html as html_mod
+import html
 import json
 import math
 import os
@@ -21,32 +30,34 @@ import time
 import tomllib
 import urllib.parse
 import webbrowser
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VIS_JS_PATH = Path(__file__).resolve().parent / "vis-network.min.js"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_FILES = {  # URL path -> (file in STATIC_DIR, content type)
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/vis-network.min.js": ("vis-network.min.js", "text/javascript; charset=utf-8"),
+}
 CONFIG_NAME = "zk-graph.toml"  # looked up in <notebook>/.zk/
-
-NOTES_DIR = "."  # set in main()
-# Order matters: the first tag listed here that a note has decides its colour.
-TAG_COLORS = {}
-# Directory (relative to the notebook) -> colour for notes with no coloured tag.
-# Sorted longest first, so the most specific directory wins.
-DIR_COLORS = {}
-DEFAULT_COLOR = "#97c2fc"
-OPEN_CMD = ["xdg-open", "{path}"]
-VIEWS_DIR = Path(".")  # set by load_config()
+DIRECTIONS = ("both", "out", "in")
 VIEW_NAME_RE = re.compile(r"\w[\w.-]*")
+LABEL_MAX = 40
+LABEL_SEPARATORS = (" — ", " – ")  # "Concept — definition" -> label "Concept"
 
 
 class ZkError(Exception):
-    pass
+    """zk failed, or the notebook or its config can't be used."""
 
 
 class ViewError(Exception):
-    pass
+    """A saved view can't be read or written: bad name, bad data, missing file."""
 
+
+# ---- Configuration -----------------------------------------------------------
 
 def find_notebook_dir(start):
     """Like zk: $ZK_NOTEBOOK_DIR, else the nearest parent directory with a .zk/."""
@@ -60,116 +71,63 @@ def find_notebook_dir(start):
     raise ZkError(f"No zk notebook found at or above {start} (and ZK_NOTEBOOK_DIR is unset)")
 
 
-def load_config(notebook):
-    """Apply <notebook>/.zk/zk-graph.toml, if present, to the module settings."""
-    global TAG_COLORS, DIR_COLORS, DEFAULT_COLOR, OPEN_CMD, VIEWS_DIR
-    VIEWS_DIR = notebook / ".zk" / "zk-graph" / "views"
-    path = notebook / ".zk" / CONFIG_NAME
-    if not path.is_file():
-        return
-    try:
-        cfg = tomllib.loads(path.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        raise ZkError(f"Cannot read {path}: {e}")
-    TAG_COLORS = dict(cfg.get("tag_colors", TAG_COLORS))
-    dirs = {d.strip("/"): c for d, c in cfg.get("dir_colors", {}).items() if d.strip("/")}
-    DIR_COLORS = dict(sorted(dirs.items(), key=lambda kv: -len(kv[0])))
-    DEFAULT_COLOR = cfg.get("default_color", DEFAULT_COLOR)
-    open_cmd = cfg.get("open_cmd", OPEN_CMD)
-    OPEN_CMD = shlex.split(open_cmd) if isinstance(open_cmd, str) else list(open_cmd)
-    if "views_dir" in cfg:
-        # Relative paths are relative to the notebook
-        VIEWS_DIR = notebook / Path(cfg["views_dir"]).expanduser()
+@dataclass
+class Config:
+    """Settings from <notebook>/.zk/zk-graph.toml, with defaults."""
+    notebook: Path
+    views_dir: Path
+    # Order matters: the first tag listed that a note has decides its colour.
+    tag_colors: dict = field(default_factory=dict)
+    # Directory (relative to the notebook) -> colour for notes with no coloured
+    # tag. Kept longest first, so the most specific directory wins.
+    dir_colors: dict = field(default_factory=dict)
+    default_color: str = "#97c2fc"
+    open_cmd: list = field(default_factory=lambda: ["xdg-open", "{path}"])
 
-
-def view_path(name):
-    if not isinstance(name, str) or not VIEW_NAME_RE.fullmatch(name):
-        raise ViewError(f"Bad view name {name!r}: use letters, digits, '_', '.' and '-'")
-    return VIEWS_DIR / f"{name}.json"
-
-
-def list_views():
-    views = []
-    for p in sorted(VIEWS_DIR.glob("*.json")) if VIEWS_DIR.is_dir() else []:
-        if not VIEW_NAME_RE.fullmatch(p.stem):
-            continue
+    @classmethod
+    def load(cls, notebook):
+        cfg = cls(notebook=notebook, views_dir=notebook / ".zk" / "zk-graph" / "views")
+        path = notebook / ".zk" / CONFIG_NAME
+        if not path.is_file():
+            return cfg
         try:
-            view = json.loads(p.read_text())
-        except (OSError, ValueError):
-            view = {}
-        views.append({"name": p.stem, "saved": view.get("saved"), "count": len(view.get("nodes") or {})})
-    return views
+            raw = tomllib.loads(path.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            raise ZkError(f"Cannot read {path}: {e}")
+        cfg.tag_colors = dict(raw.get("tag_colors", {}))
+        dirs = {d.strip("/"): c for d, c in raw.get("dir_colors", {}).items() if d.strip("/")}
+        cfg.dir_colors = dict(sorted(dirs.items(), key=lambda kv: -len(kv[0])))
+        cfg.default_color = raw.get("default_color", cfg.default_color)
+        open_cmd = raw.get("open_cmd", cfg.open_cmd)
+        cfg.open_cmd = shlex.split(open_cmd) if isinstance(open_cmd, str) else list(open_cmd)
+        if "views_dir" in raw:
+            # Relative paths are relative to the notebook
+            cfg.views_dir = notebook / Path(raw["views_dir"]).expanduser()
+        return cfg
+
+    def note_color(self, path, tags):
+        """First configured tag colour, else the most specific dir colour, else the default."""
+        for tag, color in self.tag_colors.items():
+            if tag in tags:
+                return color
+        for d, color in self.dir_colors.items():
+            if path.startswith(d + "/"):
+                return color
+        return self.default_color
+
+    def legend(self):
+        # Lists of pairs, not objects: JS would reorder integer-like keys such as "0"
+        return {"tags": list(self.tag_colors.items()), "dirs": list(self.dir_colors.items()),
+                "default": self.default_color}
 
 
-def read_view(name):
-    path = view_path(name)
-    try:
-        view = json.loads(path.read_text())
-    except FileNotFoundError:
-        raise ViewError(f"No view {name!r} in {VIEWS_DIR}")
-    except (OSError, ValueError) as e:
-        raise ViewError(f"Cannot read {path}: {e}")
-    if not isinstance(view, dict) or not isinstance(view.get("nodes"), dict):
-        raise ViewError(f"{path} has no 'nodes' object")
-    return view
+# ---- The notebook graph ---------------------------------------------------------
 
-
-def write_view(name, view):
-    """Write atomically: temp file in the same dir, then rename over the old view."""
-    path = view_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(view, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
-    except BaseException:
-        os.unlink(tmp)
-        raise
-
-
-def _finite(value, what):
-    try:
-        x = float(value)
-    except (TypeError, ValueError):
-        raise ViewError(f"Bad {what}: {value!r}")
-    if not math.isfinite(x):
-        raise ViewError(f"Bad {what}: {value!r}")
-    return x
-
-
-def clean_view(body):
-    """Validate a /views/save payload into the on-disk view format."""
-    nodes = body.get("nodes")
-    if not isinstance(nodes, dict):
-        raise ViewError("'nodes' must be an object")
-    clean_nodes = {}
-    for path, pos in nodes.items():
-        if not isinstance(pos, dict):
-            raise ViewError(f"Bad position for {path!r}")
-        clean_nodes[path] = {"x": round(_finite(pos.get("x"), "x"), 1),
-                             "y": round(_finite(pos.get("y"), "y"), 1)}
-    vp = body.get("viewport")
-    viewport = None
-    if isinstance(vp, dict):
-        viewport = {"scale": _finite(vp.get("scale"), "scale"),
-                    "x": round(_finite(vp.get("x"), "x"), 1), "y": round(_finite(vp.get("y"), "y"), 1)}
-    origin = body.get("origin")
-    return {
-        "version": 1,
-        "saved": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "nodes": clean_nodes,
-        "viewport": viewport,
-        "frozen": bool(body.get("frozen")),
-        "origin": origin if isinstance(origin, dict) else None,
-    }
-
-
-def get_graph_json():
+def run_zk_graph(notebook):
     try:
         result = subprocess.run(
-            ["zk", "--notebook-dir", NOTES_DIR, "graph", "-f", "json", "-q"],
-            capture_output=True, text=True, cwd=NOTES_DIR,
+            ["zk", "--notebook-dir", str(notebook), "graph", "-f", "json", "-q"],
+            capture_output=True, text=True, cwd=notebook,
         )
     except FileNotFoundError:
         raise ZkError("zk not found in PATH")
@@ -205,139 +163,228 @@ def changed_since(root, ts):
     return False
 
 
-DIRECTIONS = ("both", "out", "in")
+class Graph:
+    """One snapshot of the notebook: notes by path, links, and adjacency."""
 
-
-def adjacency(links, notes_by_path):
-    """Unique neighbours per note as ({path: outgoing}, {path: incoming}), no self-links."""
-    out, inc = {}, {}
-    for link in links:
-        src = link.get("sourcePath")
-        tgt = link.get("targetPath")
-        if src == tgt or src not in notes_by_path or tgt not in notes_by_path:
-            continue
-        out.setdefault(src, set()).add(tgt)
-        inc.setdefault(tgt, set()).add(src)
-    return out, inc
-
-
-def linked(adj, path, direction="both"):
-    """Notes that `path` links to (out), that link to it (in), or both."""
-    out, inc = adj
-    if direction == "out":
-        return out.get(path, set())
-    if direction == "in":
-        return inc.get(path, set())
-    return out.get(path, set()) | inc.get(path, set())
-
-
-def filter_graph(data, adj, filter_str, filter_path, depth=1, direction="both"):
-    if filter_str or filter_path:
-        matched = set()
-        for n in data["notes"]:
-            path = n["path"]
-            if filter_path and not path.startswith(filter_path):
+    def __init__(self, notes, links):
+        self.notes = {n["path"]: n for n in notes}
+        self.links = links
+        # Unique neighbours per note, without self-links
+        self.out, self.inc = {}, {}
+        for link in links:
+            src, tgt = link.get("sourcePath"), link.get("targetPath")
+            if src == tgt or src not in self.notes or tgt not in self.notes:
                 continue
-            if filter_str:
-                searchable = (n.get("title") or "") + " " + (n.get("lead") or "") + " " + path
-                if filter_str.lower() not in searchable.lower():
-                    continue
-            matched.add(path)
+            self.out.setdefault(src, set()).add(tgt)
+            self.inc.setdefault(tgt, set()).add(src)
 
-        # BFS expansion to depth, following links in `direction`
-        included = set(matched)
-        frontier = set(matched)
+    def linked(self, path, direction="both"):
+        """Notes that `path` links to (out), that link to it (in), or both."""
+        if direction == "out":
+            return self.out.get(path, set())
+        if direction == "in":
+            return self.inc.get(path, set())
+        return self.out.get(path, set()) | self.inc.get(path, set())
+
+    def select(self, text="", path_prefix="", depth=1, direction="both"):
+        """Paths of notes matching text (in title, lead or path) and path prefix,
+        plus notes up to `depth` links away in `direction`. No filter: all notes."""
+        if not text and not path_prefix:
+            return list(self.notes)
+        text = text.lower()
+        matched = {
+            p for p, n in self.notes.items()
+            if p.startswith(path_prefix)
+            and text in f"{n.get('title') or ''} {n.get('lead') or ''} {p}".lower()
+        }
+        included, frontier = set(matched), set(matched)
         for _ in range(depth):
-            next_frontier = set()
-            for node in frontier:
-                for nb in linked(adj, node, direction):
-                    if nb not in included:
-                        next_frontier.add(nb)
-            included |= next_frontier
-            frontier = next_frontier
+            frontier = {nb for p in frontier for nb in self.linked(p, direction)} - included
             if not frontier:
                 break
+            included |= frontier
+        return [p for p in self.notes if p in included]
 
-        data["notes"] = [n for n in data["notes"] if n["path"] in included]
-        data["links"] = [
-            l for l in data["links"]
-            if l.get("sourcePath", "") in included and l.get("targetPath", "") in included
-        ]
-
-    return data
-
-
-def note_color(path, tags):
-    """First configured tag colour, else the most specific dir colour, else the default."""
-    for tag, color in TAG_COLORS.items():
-        if tag in tags:
-            return color
-    for d, color in DIR_COLORS.items():
-        if path.startswith(d + "/"):
-            return color
-    return DEFAULT_COLOR
+    def vis_edges(self, allowed):
+        """Unique, non-self edges whose both endpoints are in `allowed`."""
+        seen = set()
+        edges = []
+        for link in self.links:
+            src, tgt = link.get("sourcePath"), link.get("targetPath")
+            if src == tgt or (src, tgt) in seen or src not in allowed or tgt not in allowed:
+                continue
+            seen.add((src, tgt))
+            edges.append({"id": f"{src}\n{tgt}", "from": src, "to": tgt})
+        return edges
 
 
-def note_to_vis_node(n, adj):
-    label = n.get("title") or n.get("lead") or n.get("filenameStem") or n["path"]
-    if len(label) > 60:
-        label = label[:57] + "..."
-    tags = n.get("tags") or []
-    color = note_color(n["path"], tags)
-    tags_str = ", ".join(tags)
-    n_out = len(linked(adj, n["path"], "out"))
-    n_in = len(linked(adj, n["path"], "in"))
-    degree = len(linked(adj, n["path"]))
-    body = (n.get("body") or "").strip()
-    preview_lines = body.split("\n")[:8]
-    preview = html_mod.escape("\n".join(preview_lines))
-    tooltip = f"<b>{html_mod.escape(label)}</b>"
-    if tags_str:
-        tooltip += f"<br><i>{html_mod.escape(tags_str)}</i>"
-    tooltip += f"<br><small>{n_out} outgoing · {n_in} backlinks</small>"
+class Notebook:
+    """The notebook's Graph, cached; re-read via zk only when files changed."""
+
+    def __init__(self, root):
+        self.root = root
+        self.graph = None
+        self._loaded_at = 0.0  # time.time() just before the last `zk graph` run
+        self._lock = threading.Lock()
+
+    def reload(self):
+        # Stamp before running zk, so edits made while it runs trigger the next reload
+        started = time.time()
+        data = run_zk_graph(self.root)
+        self.graph = Graph(data["notes"], data["links"])
+        self._loaded_at = started
+        return self.graph
+
+    def current(self):
+        with self._lock:
+            if self.graph is None or changed_since(self.root, self._loaded_at):
+                return self.reload()
+            return self.graph
+
+
+# ---- Graph -> vis-network data ---------------------------------------------------
+
+def short_label(title):
+    """The part of a title before its first separator, cut at a word boundary."""
+    for sep in LABEL_SEPARATORS:
+        head = title.split(sep, 1)[0]
+        if head and head != title:
+            title = head
+            break
+    if len(title) > LABEL_MAX:
+        cut = title[:LABEL_MAX].rsplit(" ", 1)[0]
+        title = (cut if len(cut) > LABEL_MAX // 2 else title[:LABEL_MAX]).rstrip(" ,.;-") + "…"
+    return title
+
+
+def vis_node(note, graph, config):
+    path = note["path"]
+    full = note.get("title") or note.get("lead") or note.get("filenameStem") or path
+    tags = note.get("tags") or []
+    preview = "\n".join((note.get("body") or "").strip().split("\n")[:8])
+    tooltip = f"<b>{html.escape(full)}</b>"
+    if tags:
+        tooltip += f"<br><i>{html.escape(', '.join(tags))}</i>"
+    tooltip += (f"<br><small>{len(graph.linked(path, 'out'))} outgoing · "
+                f"{len(graph.linked(path, 'in'))} backlinks</small>")
     if preview:
-        tooltip += f"<hr style='margin:4px 0;border-color:#555'><pre style='margin:0;white-space:pre-wrap'>{preview}</pre>"
-    # Size by log of distinct linked notes over the whole notebook, so a few
-    # hubs don't shrink everything else to the minimum.
-    value = round(math.log2(degree + 1), 3)
-    return {"id": n["path"], "label": label, "color": color, "title": tooltip, "value": value}
+        tooltip += (f"<hr style='margin:4px 0;border-color:#555'>"
+                    f"<pre style='margin:0;white-space:pre-wrap'>{html.escape(preview)}</pre>")
+    return {
+        "id": path,
+        "label": short_label(full),
+        "full": full,  # for search, which should also match the part cut from the label
+        "color": config.note_color(path, tags),
+        "title": tooltip,
+        # Size by log of distinct linked notes over the whole notebook, so a few
+        # hubs don't shrink everything else to the minimum.
+        "value": round(math.log2(len(graph.linked(path)) + 1), 3),
+    }
 
 
-def vis_edges(links, allowed):
-    """Unique, non-self edges whose both endpoints are in `allowed`."""
-    seen = set()
-    edges = []
-    for link in links:
-        src = link.get("sourcePath")
-        tgt = link.get("targetPath")
-        if not src or not tgt or src == tgt or (src, tgt) in seen:
-            continue
-        if src not in allowed or tgt not in allowed:
-            continue
-        seen.add((src, tgt))
-        edges.append({"id": f"{src}\n{tgt}", "from": src, "to": tgt})
-    return edges
-
-
-def build_vis_data(data, adj):
-    nodes = [note_to_vis_node(n, adj) for n in data["notes"]]
-    edges = vis_edges(data["links"], {n["path"] for n in data["notes"]})
-    return {"nodes": nodes, "edges": edges}
-
-
-def view_to_vis(view, notes_by_path, links, adj):
-    """A saved view's notes with the notebook's current content and links, at
-    their saved positions. Returns (vis data, number of deleted notes dropped)."""
+def vis_graph(paths, graph, config, positions=None):
+    """Nodes for those `paths` that still exist (at `positions`, if given) and
+    the edges among them."""
     nodes = []
-    for path, pos in view["nodes"].items():
-        if path not in notes_by_path:
+    for p in paths:
+        if p not in graph.notes:
             continue
-        node = note_to_vis_node(notes_by_path[path], adj)
+        node = vis_node(graph.notes[p], graph, config)
+        pos = (positions or {}).get(p)
         if isinstance(pos, dict) and all(isinstance(pos.get(k), (int, float)) for k in ("x", "y")):
             node["x"], node["y"] = pos["x"], pos["y"]
         nodes.append(node)
-    edges = vis_edges(links, {n["id"] for n in nodes})
-    return {"nodes": nodes, "edges": edges}, len(view["nodes"]) - len(nodes)
+    return {"nodes": nodes, "edges": graph.vis_edges({n["id"] for n in nodes})}
+
+
+# ---- Saved views -----------------------------------------------------------------
+
+class Views:
+    """Saved views: one JSON file per view in a directory."""
+
+    def __init__(self, directory):
+        self.dir = directory
+
+    def path(self, name):
+        if not isinstance(name, str) or not VIEW_NAME_RE.fullmatch(name):
+            raise ViewError(f"Bad view name {name!r}: use letters, digits, '_', '.' and '-'")
+        return self.dir / f"{name}.json"
+
+    def list(self):
+        views = []
+        for p in sorted(self.dir.glob("*.json")) if self.dir.is_dir() else []:
+            if not VIEW_NAME_RE.fullmatch(p.stem):
+                continue
+            try:
+                view = json.loads(p.read_text())
+            except (OSError, ValueError):
+                view = {}
+            views.append({"name": p.stem, "saved": view.get("saved"),
+                          "count": len(view.get("nodes") or {})})
+        return views
+
+    def read(self, name):
+        path = self.path(name)
+        try:
+            view = json.loads(path.read_text())
+        except FileNotFoundError:
+            raise ViewError(f"No view {name!r} in {self.dir}")
+        except (OSError, ValueError) as e:
+            raise ViewError(f"Cannot read {path}: {e}")
+        if not isinstance(view, dict) or not isinstance(view.get("nodes"), dict):
+            raise ViewError(f"{path} has no 'nodes' object")
+        return view
+
+    def write(self, name, view):
+        """Write atomically: temp file in the same dir, then rename over the old view."""
+        path = self.path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(view, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+
+
+def _finite(value, what):
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        raise ViewError(f"Bad {what}: {value!r}")
+    if not math.isfinite(x):
+        raise ViewError(f"Bad {what}: {value!r}")
+    return x
+
+
+def clean_view(body):
+    """Validate a /views/save payload into the on-disk view format."""
+    nodes = body.get("nodes")
+    if not isinstance(nodes, dict):
+        raise ViewError("'nodes' must be an object")
+    clean_nodes = {}
+    for path, pos in nodes.items():
+        if not isinstance(pos, dict):
+            raise ViewError(f"Bad position for {path!r}")
+        clean_nodes[path] = {"x": round(_finite(pos.get("x"), "x"), 1),
+                             "y": round(_finite(pos.get("y"), "y"), 1)}
+    vp = body.get("viewport")
+    viewport = None
+    if isinstance(vp, dict):
+        viewport = {"scale": _finite(vp.get("scale"), "scale"),
+                    "x": round(_finite(vp.get("x"), "x"), 1),
+                    "y": round(_finite(vp.get("y"), "y"), 1)}
+    origin = body.get("origin")
+    return {
+        "version": 1,
+        "saved": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "nodes": clean_nodes,
+        "viewport": viewport,
+        "frozen": bool(body.get("frozen")),
+        "origin": origin if isinstance(origin, dict) else None,
+    }
 
 
 def view_state(view, name):
@@ -347,476 +394,159 @@ def view_state(view, name):
             "frozen": bool(view.get("frozen")), "origin": view.get("origin")}
 
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>ZK Graph</title>
-<script src="/vis-network.min.js"></script>
-<style>
-  body { margin: 0; overflow: hidden; font-family: sans-serif; background: #1e1e1e; }
-  #graph { width: 100vw; height: 100vh; }
-  #legend {
-    position: absolute; top: 10px; right: 10px; background: rgba(30,30,30,0.9);
-    color: #ccc; padding: 10px; border-radius: 6px; font-size: 13px;
-  }
-  #legend div { margin: 3px 0; }
-  #legend span { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
-    vertical-align: middle; margin-right: 6px; }
-  #toolbar {
-    position: absolute; top: 10px; left: 10px; display: flex; gap: 6px;
-  }
-  #toolbar button, #toolbar input, #toolbar select {
-    background: rgba(30,30,30,0.9); color: #ccc; border: 1px solid #555;
-    padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px;
-  }
-  #toolbar button:hover { background: rgba(60,60,60,0.9); }
-  #toolbar button.active { background: #e74c3c; color: #fff; border-color: #e74c3c; }
-  #toolbar input { width: 180px; cursor: text; }
-  #toolbar select { max-width: 220px; }
-  #info {
-    position: absolute; bottom: 10px; left: 10px; background: rgba(30,30,30,0.9);
-    color: #ccc; padding: 8px 12px; border-radius: 6px; font-size: 13px;
-  }
-  #ctxmenu {
-    display: none; position: absolute; background: #2a2a2a; border: 1px solid #555;
-    border-radius: 4px; padding: 4px 0; z-index: 1000; min-width: 160px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-  }
-  #ctxmenu div {
-    padding: 6px 14px; color: #ccc; cursor: pointer; font-size: 13px;
-  }
-  #ctxmenu div:hover { background: #3a3a3a; }
-  #ctxmenu div.sep { border-top: 1px solid #444; margin: 2px 0; padding: 0; cursor: default; }
-  #ctxmenu .key { float: right; margin-left: 16px; color: #777; }
-</style>
-</head>
-<body>
-<div id="graph"></div>
-<div id="toolbar">
-  <button id="btnRefresh">Refresh</button>
-  <button id="btnFreeze" title="Space to toggle">Freeze</button>
-  <button id="btnFit">Fit</button>
-  <input id="search" type="text" placeholder="Search nodes..." title="Ctrl+F">
-  <select id="viewSelect" title="Switch to a saved view"></select>
-  <button id="btnSave" title="Ctrl+S">Save view</button>
-</div>
-<div id="legend">
-@@LEGEND_ITEMS@@
-</div>
-<div id="info"></div>
-<div id="ctxmenu">
-  <div data-dir="both">Add all linked notes</div>
-  <div data-dir="out">Add outgoing links <span class="key">Ctrl+click</span></div>
-  <div data-dir="in">Add backlinks</div>
-  <div class="sep"></div>
-  <div id="ctx-remove">Remove node</div>
-</div>
-<script>
-var graphData = @@GRAPH_DATA@@;
-var TOKEN = @@TOKEN@@;
-var VIEW = @@VIEW@@;  // {name, viewport, frozen, origin} of the view shown at start
-var HELP = " — Double-click: open | Ctrl+click: add outgoing | Right-click: expand/remove | Space: freeze | Ctrl+F: search | Ctrl+S: save view";
-var frozen = VIEW.frozen;
-var currentView = VIEW.name;  // null until the view is saved or a saved one is loaded
-var viewOrigin = VIEW.origin;
-var dirty = false;            // unsaved changes to the current view
+# ---- Opening notes ----------------------------------------------------------------
 
-// Convert HTML title strings to DOM elements for rich tooltips
-function prepNode(n) {
-  var div = document.createElement("div");
-  div.style.cssText = "background:#2a2a2a;color:#ccc;padding:12px 14px;border-radius:4px;max-width:600px;font-size:14px;line-height:1.5";
-  div.innerHTML = n.title;
-  n.title = div;
-  return n;
-}
-
-function api(route, payload) {
-  return fetch(route, {
-    method: "POST",
-    headers: {"Content-Type": "application/json", "X-Token": TOKEN},
-    body: JSON.stringify(payload)
-  }).then(function(r) {
-    if (!r.ok) return r.text().then(function(t) { throw new Error(t || r.status); });
-    return r.json();
-  });
-}
-
-var nodes = new vis.DataSet(graphData.nodes.map(prepNode));
-var edges = new vis.DataSet(graphData.edges);
-
-var container = document.getElementById("graph");
-var data = { nodes: nodes, edges: edges };
-var options = {
-  nodes: {
-    shape: "dot",
-    scaling: { min: 6, max: 36 },
-    font: { color: "#ccc", size: 11 },
-    borderWidth: 1,
-  },
-  edges: {
-    color: { color: "#555", highlight: "#aaa" },
-    arrows: { to: { enabled: true, scaleFactor: 0.5 } },
-    smooth: { type: "continuous" },
-  },
-  physics: {
-    enabled: !frozen,
-    solver: "forceAtlas2Based",
-    forceAtlas2Based: {
-      gravitationalConstant: -30,
-      centralGravity: 0.005,
-      springLength: 100,
-      springConstant: 0.02,
-      damping: 0.4,
-    },
-    // Don't let the initial layout re-fit over a saved viewport
-    stabilization: { iterations: 150, fit: !VIEW.viewport },
-  },
-  interaction: {
-    hover: true,
-    tooltipDelay: 100,
-    navigationButtons: true,
-    keyboard: { enabled: true, bindToWindow: false },
-  },
-  layout: { improvedLayout: false },
-};
-
-var network = new vis.Network(container, data, options);
-
-function applyViewport(vp) {
-  if (vp && isFinite(vp.scale) && isFinite(vp.x) && isFinite(vp.y)) {
-    network.moveTo({ position: { x: vp.x, y: vp.y }, scale: vp.scale });
-  } else {
-    network.fit();
-  }
-}
-if (VIEW.viewport) applyViewport(VIEW.viewport);
-
-function setInfo(msg) {
-  var view = currentView ? "View: " + currentView + (dirty ? "*" : "") + " | " : "";
-  document.getElementById("info").textContent =
-    msg || (view + "Nodes: " + nodes.length + " | Edges: " + edges.length + HELP);
-}
-function markDirty() {
-  if (!dirty) { dirty = true; setInfo(); }
-}
-function showError(err) {
-  setInfo("Error: " + err.message);
-  setTimeout(function() { setInfo(); }, 5000);
-}
-setInfo();
-
-// Add fresh edges whose endpoints are displayed; drop displayed edges that
-// isStale() claims for this sync but that are absent from the fresh set.
-function syncEdges(fresh, isStale) {
-  var freshIds = new Set();
-  var toAdd = [];
-  fresh.forEach(function(e) {
-    freshIds.add(e.id);
-    if (!edges.get(e.id) && nodes.get(e.from) && nodes.get(e.to)) toAdd.push(e);
-  });
-  edges.add(toAdd);
-  edges.remove(edges.getIds({
-    filter: function(e) { return isStale(e) && !freshIds.has(e.id); }
-  }));
-}
-
-function removeNode(id) {
-  edges.remove(edges.getIds({ filter: function(e) { return e.from === id || e.to === id; } }));
-  nodes.remove(id);
-}
-
-// Freeze / unfreeze
-var btnFreeze = document.getElementById("btnFreeze");
-function setFrozen(f) {
-  frozen = f;
-  network.setOptions({ physics: { enabled: !frozen } });
-  btnFreeze.textContent = frozen ? "Unfreeze" : "Freeze";
-  btnFreeze.classList.toggle("active", frozen);
-}
-function toggleFreeze() { setFrozen(!frozen); markDirty(); }
-setFrozen(frozen);
-btnFreeze.addEventListener("click", toggleFreeze);
-network.on("dragEnd", function(params) { if (params.nodes.length > 0) markDirty(); });
-
-document.addEventListener("keydown", function(e) {
-  if (e.target.tagName === "INPUT") return;
-  if (e.code === "Space") { e.preventDefault(); toggleFreeze(); }
-});
-
-// Fit
-document.getElementById("btnFit").addEventListener("click", function() {
-  network.fit({ animation: { duration: 500, easingFunction: "easeInOutQuad" } });
-});
-
-// Search
-var searchInput = document.getElementById("search");
-function matches(n, q) {
-  return n.label.toLowerCase().includes(q) || n.id.toLowerCase().includes(q);
-}
-function applySearch(q) {
-  nodes.update(nodes.get().map(function(n) {
-    var m = !q || matches(n, q);
-    return { id: n.id, opacity: m ? 1 : 0.1, font: { color: !q ? "#ccc" : m ? "#fff" : "#333" } };
-  }));
-}
-document.addEventListener("keydown", function(e) {
-  if (e.ctrlKey && e.key === "f") { e.preventDefault(); searchInput.focus(); searchInput.select(); }
-  if (e.ctrlKey && e.key === "s") { e.preventDefault(); saveView(); }
-});
-var searchTimer = null;
-searchInput.addEventListener("input", function() {
-  clearTimeout(searchTimer);
-  var q = this.value.toLowerCase();
-  searchTimer = setTimeout(function() { applySearch(q); }, 400);
-});
-searchInput.addEventListener("keydown", function(e) {
-  if (e.key === "Escape") { this.value = ""; this.dispatchEvent(new Event("input")); this.blur(); }
-  if (e.key === "Enter") {
-    var q = this.value.toLowerCase();
-    var found = nodes.get({ filter: function(n) { return matches(n, q); } })[0];
-    if (found) { network.focus(found.id, { scale: 1.5, animation: { duration: 500 } }); network.selectNodes([found.id]); }
-  }
-});
-
-// Double-click to open
-network.on("doubleClick", function(params) {
-  if (params.nodes.length > 0) {
-    api("/open", { path: params.nodes[0] }).catch(showError);
-  }
-});
-
-// Context menu
-var ctxmenu = document.getElementById("ctxmenu");
-var ctxNodeId = null;
-
-function hideCtxMenu() { ctxmenu.style.display = "none"; ctxNodeId = null; }
-document.addEventListener("click", hideCtxMenu);
-document.addEventListener("keydown", function(e) { if (e.key === "Escape") hideCtxMenu(); });
-
-network.on("oncontext", function(params) {
-  params.event.preventDefault();
-  var nodeId = network.getNodeAt(params.pointer.DOM);
-  if (!nodeId) { hideCtxMenu(); return; }
-  ctxNodeId = nodeId;
-  ctxmenu.style.left = params.event.pageX + "px";
-  ctxmenu.style.top = params.event.pageY + "px";
-  ctxmenu.style.display = "block";
-});
-
-document.getElementById("ctx-remove").addEventListener("click", function() {
-  if (!ctxNodeId) return;
-  removeNode(ctxNodeId);
-  markDirty();
-  setInfo();
-  hideCtxMenu();
-});
-
-// Add the notes linked with `path` in `direction` ("both", "out" or "in")
-function expand(path, direction) {
-  setInfo("Loading linked notes…");
-  api("/neighbors", { path: path, direction: direction, shown: nodes.getIds() })
-    .then(function(result) {
-      var added = result.nodes.filter(function(n) { return !nodes.get(n.id); });
-      // Start new notes on a circle around the clicked one, so they don't pile
-      // up in the middle when the layout is frozen
-      var c = nodes.get(path) ? network.getPosition(path) : { x: 0, y: 0 };
-      added.forEach(function(n, i) {
-        var a = 2 * Math.PI * i / added.length;
-        n.x = c.x + 150 * Math.cos(a);
-        n.y = c.y + 150 * Math.sin(a);
-      });
-      nodes.add(added.map(prepNode));
-      // Edges among shown + new nodes; stale ones only for the clicked node
-      syncEdges(result.edges, function(e) { return e.from === path || e.to === path; });
-      if (added.length) markDirty();
-      setInfo();
-    })
-    .catch(showError);
-}
-
-ctxmenu.querySelectorAll("[data-dir]").forEach(function(item) {
-  item.addEventListener("click", function() {
-    if (!ctxNodeId) return;
-    var path = ctxNodeId;
-    hideCtxMenu();
-    expand(path, item.dataset.dir);
-  });
-});
-
-// Ctrl+click (Cmd+click on macOS): add outgoing links
-network.on("click", function(params) {
-  var ev = params.event && params.event.srcEvent;
-  if (ev && (ev.ctrlKey || ev.metaKey) && params.nodes.length > 0) expand(params.nodes[0], "out");
-});
-
-// Refresh: re-read displayed nodes from disk, sync their edges
-document.getElementById("btnRefresh").addEventListener("click", function() {
-  var btn = this;
-  btn.textContent = "Refreshing...";
-  btn.disabled = true;
-  var displayedPaths = nodes.getIds();
-  api("/refresh", { paths: displayedPaths })
-    .then(function(result) {
-      // Update node content (tooltips, labels, colors)
-      nodes.update(result.nodes.map(prepNode));
-      // Remove nodes that no longer exist on disk
-      var freshIds = new Set(result.nodes.map(function(n) { return n.id; }));
-      displayedPaths.forEach(function(id) { if (!freshIds.has(id)) removeNode(id); });
-      syncEdges(result.edges, function() { return true; });
-      setInfo();
-    })
-    .catch(showError)
-    .finally(function() {
-      btn.textContent = "Refresh";
-      btn.disabled = false;
-    });
-});
-
-// Saved views
-var viewSelect = document.getElementById("viewSelect");
-
-function refreshViewList() {
-  return api("/views/list", {}).then(function(r) {
-    viewSelect.innerHTML = "";
-    var placeholder = new Option(r.views.length ? "Views…" : "No saved views", "");
-    placeholder.disabled = true;
-    viewSelect.add(placeholder);
-    r.views.forEach(function(v) {
-      viewSelect.add(new Option(v.name + " (" + v.count + ")", v.name));
-    });
-    viewSelect.value = currentView || "";
-  });
-}
-
-function saveView() {
-  var name = prompt("Save view as (letters, digits, _ . -):", currentView || "");
-  if (name === null) return;
-  name = name.trim();
-  if (!name) return;
-  var center = network.getViewPosition();
-  api("/views/save", {
-    name: name,
-    nodes: network.getPositions(),
-    viewport: { scale: network.getScale(), x: center.x, y: center.y },
-    frozen: frozen,
-    origin: viewOrigin
-  })
-    .then(function() {
-      currentView = name;
-      dirty = false;
-      setInfo();
-      return refreshViewList();
-    })
-    .catch(showError);
-}
-
-function loadView(name) {
-  if (dirty && !confirm("Discard unsaved changes to the current view?")) {
-    viewSelect.value = currentView || "";
-    return;
-  }
-  setInfo("Loading view " + name + "…");
-  api("/views/load", { name: name })
-    .then(function(v) {
-      setFrozen(v.frozen);  // before adding nodes, so a frozen view stays put
-      edges.clear();
-      nodes.clear();
-      nodes.add(v.graph.nodes.map(prepNode));
-      edges.add(v.graph.edges);
-      currentView = v.name;
-      viewOrigin = v.origin;
-      dirty = false;
-      searchInput.value = "";
-      applyViewport(v.viewport);
-      viewSelect.value = v.name;
-      if (v.missing) {
-        setInfo("View " + v.name + ": " + v.missing + " deleted note(s) dropped");
-        setTimeout(function() { setInfo(); }, 5000);
-      } else {
-        setInfo();
-      }
-    })
-    .catch(function(err) {
-      viewSelect.value = currentView || "";
-      showError(err);
-    });
-}
-
-viewSelect.addEventListener("change", function() { if (this.value) loadView(this.value); });
-document.getElementById("btnSave").addEventListener("click", saveView);
-refreshViewList().catch(showError);
-</script>
-</body>
-</html>"""
-
-
-def script_json(obj):
-    """JSON safe to embed inside a <script> block."""
-    return json.dumps(obj).replace("</", "<\\/")
-
-
-def make_html(vis_data, token, state):
-    entries = [(f"#{tag}", color) for tag, color in TAG_COLORS.items()]
-    entries += [(f"{d}/ (untagged)", color) for d, color in DIR_COLORS.items()]
-    entries.append(("Other" if TAG_COLORS or DIR_COLORS else "Note", DEFAULT_COLOR))
-    legend_items = "\n".join(
-        f'  <div><span style="background:{html_mod.escape(color)}"></span>{html_mod.escape(label)}</div>'
-        for label, color in entries
-    )
-    subs = {
-        "LEGEND_ITEMS": legend_items,
-        "GRAPH_DATA": script_json(vis_data),
-        "TOKEN": script_json(token),
-        "VIEW": script_json(state),
-    }
-    # Single pass, so substituted note content is never re-scanned for markers
-    return re.sub(r"@@(\w+)@@", lambda m: subs[m.group(1)], HTML_TEMPLATE)
-
-
-def open_note(path):
-    """Run OPEN_CMD with {path}/{notebook} filled in; path is appended if absent."""
-    fields = {"path": os.path.join(NOTES_DIR, path), "notebook": NOTES_DIR}
+def open_note(path, config):
+    """Run open_cmd with {path}/{notebook} filled in; path is appended if absent."""
+    abs_path = str(config.notebook / path)
     # Plain str.replace per argument: no shell, so note paths can't inject commands
-    cmd = [arg.replace("{path}", fields["path"]).replace("{notebook}", fields["notebook"])
-           for arg in OPEN_CMD]
-    if not any("{path}" in arg for arg in OPEN_CMD):
-        cmd.append(fields["path"])
+    cmd = [arg.replace("{path}", abs_path).replace("{notebook}", str(config.notebook))
+           for arg in config.open_cmd]
+    if not any("{path}" in arg for arg in config.open_cmd):
+        cmd.append(abs_path)
     subprocess.Popen(
-        cmd, cwd=NOTES_DIR, start_new_session=True,
+        cmd, cwd=config.notebook, start_new_session=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
-class GraphHandler(BaseHTTPRequestHandler):
-    html_content = b""
-    vis_js = b""
-    token = ""
-    allowed_hosts = set()
-    notes_by_path = {}  # all notes keyed by path
-    links = []          # all links from zk
-    adj = ({}, {})      # adjacency() of the whole notebook
-    loaded_at = 0.0     # time.time() just before the last `zk graph` run
-    reload_lock = threading.Lock()
+# ---- The application: API handlers ----------------------------------------------
 
-    @classmethod
-    def reload(cls):
-        # Stamp before running zk, so edits made while it runs trigger the next reload
-        started = time.time()
-        fresh = get_graph_json()
-        notes_by_path = {n["path"]: n for n in fresh["notes"]}
-        adj = adjacency(fresh["links"], notes_by_path)
-        cls.notes_by_path, cls.links, cls.adj = notes_by_path, fresh["links"], adj
-        cls.loaded_at = started
-        return notes_by_path, fresh["links"], adj
+class HttpError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
-    @classmethod
-    def current(cls):
-        """The cached graph, re-read via zk only if notebook files changed since."""
-        with cls.reload_lock:
-            if changed_since(NOTES_DIR, cls.loaded_at):
-                return cls.reload()
-            return cls.notes_by_path, cls.links, cls.adj
+
+class App:
+    """State shared by all requests, and one method per API route. Each method
+    takes the JSON request body and returns a JSON-serializable result."""
+
+    def __init__(self, config, notebook, views, initial):
+        self.config = config
+        self.notebook = notebook
+        self.views = views
+        # What /init shows: {"paths", "positions", "view"}. Built from the
+        # current notebook on each request, so reloading the page shows fresh notes.
+        self.initial = initial
+        self.token = secrets.token_urlsafe(32)
+        self.allowed_hosts = set()  # set once the port is known
+
+    def init(self):
+        graph = self.notebook.current()
+        return {
+            "token": self.token,
+            "legend": self.config.legend(),
+            "view": self.initial["view"],
+            "graph": vis_graph(self.initial["paths"], graph, self.config, self.initial["positions"]),
+        }
+
+    def open(self, body):
+        path = body.get("path", "")
+        if path not in self.notebook.graph.notes:
+            raise HttpError(404, "unknown note")
+        try:
+            open_note(path, self.config)
+        except OSError as e:
+            raise HttpError(500, f"open_cmd failed: {e}")
+        return {"ok": True}
+
+    def neighbors(self, body):
+        """The note's linked notes in `direction`, and edges among the shown and new notes."""
+        path, direction = body.get("path", ""), body.get("direction", "both")
+        if direction not in DIRECTIONS:
+            raise HttpError(400, "bad direction")
+        graph = self.notebook.current()
+        found = graph.linked(path, direction)
+        return {"nodes": [vis_node(graph.notes[p], graph, self.config) for p in found],
+                "edges": graph.vis_edges(set(body.get("shown", [])) | found | {path})}
+
+    def refresh(self, body):
+        """Fresh nodes for the displayed paths that still exist, and the edges among them."""
+        return vis_graph(body.get("paths", []), self.notebook.current(), self.config)
+
+    def views_list(self, body):
+        return {"views": self.views.list()}
+
+    def views_load(self, body):
+        name = body.get("name")
+        view = self.views.read(name)
+        graph = vis_graph(view["nodes"], self.notebook.current(), self.config, view["nodes"])
+        return {"graph": graph, "missing": len(view["nodes"]) - len(graph["nodes"]),
+                **view_state(view, name)}
+
+    def views_save(self, body):
+        name = body.get("name")
+        self.views.write(name, clean_view(body))
+        return {"ok": True, "name": name}
+
+
+API_ROUTES = {
+    "/open": App.open,
+    "/neighbors": App.neighbors,
+    "/refresh": App.refresh,
+    "/views/list": App.views_list,
+    "/views/load": App.views_load,
+    "/views/save": App.views_save,
+}
+
+
+# ---- HTTP ------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    """Static files and /init over GET; the API over POST. Security: only our
+    own Host is accepted (blocks DNS rebinding), and POSTs need the per-run
+    token in the X-Token header, which forces a CORS preflight that we never
+    answer, so other sites in the browser can't call the API."""
+
+    @property
+    def app(self):
+        return self.server.app
+
+    def do_GET(self):
+        if not self._host_ok():
+            return self._send(403, b"forbidden")
+        route = urllib.parse.urlparse(self.path).path
+        if route == "/init":
+            return self._respond(self.app.init)
+        if route in STATIC_FILES:
+            name, ctype = STATIC_FILES[route]
+            # Read per request, so edits to static/ show up on a page reload
+            return self._send(200, (STATIC_DIR / name).read_bytes(), ctype)
+        if route == "/favicon.ico":
+            return self._send(204)
+        self._send(404, b"not found")
+
+    def do_POST(self):
+        token = self.headers.get("X-Token", "")
+        if not self._host_ok() or not hmac.compare_digest(token.encode(), self.app.token.encode()):
+            return self._send(403, b"forbidden")
+        handler = API_ROUTES.get(urllib.parse.urlparse(self.path).path)
+        if handler is None:
+            return self._send(404, b"not found")
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._send(400, b"bad json")
+        if not isinstance(body, dict):
+            return self._send(400, b"body must be a JSON object")
+        self._respond(lambda: handler(self.app, body))
+
+    def _respond(self, produce):
+        """Send produce()'s result as JSON, or map its exception to an HTTP error."""
+        try:
+            result = produce()
+        except HttpError as e:
+            return self._send(e.status, str(e).encode())
+        except ViewError as e:
+            return self._send(400, str(e).encode())
+        except (ZkError, OSError) as e:
+            return self._send(500, str(e).encode())
+        self._send(200, json.dumps(result).encode(), "application/json; charset=utf-8")
+
+    def _host_ok(self):
+        return self.headers.get("Host", "") in self.app.allowed_hosts
 
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8"):
         self.send_response(code)
@@ -825,91 +555,13 @@ class GraphHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, obj):
-        self._send(200, json.dumps(obj).encode(), "application/json; charset=utf-8")
-
-    def _host_ok(self):
-        # Blocks DNS-rebinding: only our own origin names are accepted
-        return self.headers.get("Host", "") in self.allowed_hosts
-
-    def do_GET(self):
-        if not self._host_ok():
-            return self._send(403, b"forbidden")
-        route = urllib.parse.urlparse(self.path).path
-        if route == "/":
-            return self._send(200, self.html_content, "text/html; charset=utf-8")
-        if route == "/vis-network.min.js":
-            return self._send(200, self.vis_js, "text/javascript; charset=utf-8")
-        self._send(404, b"not found")
-
-    def do_POST(self):
-        # The custom X-Token header forces a CORS preflight, which we never
-        # answer, so other sites can't trigger these endpoints.
-        token = self.headers.get("X-Token", "")
-        if not self._host_ok() or not hmac.compare_digest(token.encode(), self.token.encode()):
-            return self._send(403, b"forbidden")
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
-            return self._send(400, b"bad json")
-
-        route = urllib.parse.urlparse(self.path).path
-        try:
-            if route == "/open":
-                path = body.get("path", "")
-                if path not in self.notes_by_path:
-                    return self._send(404, b"unknown note")
-                try:
-                    open_note(path)
-                except OSError as e:
-                    return self._send(500, f"open_cmd failed: {e}".encode())
-                return self._send_json({"ok": True})
-            if route == "/neighbors":
-                direction = body.get("direction", "both")
-                if direction not in DIRECTIONS:
-                    return self._send(400, b"bad direction")
-                return self._send_json(self._neighbors(
-                    body.get("path", ""), direction, set(body.get("shown", []))))
-            if route == "/refresh":
-                return self._send_json(self._refresh(set(body.get("paths", []))))
-            if route == "/views/list":
-                return self._send_json({"views": list_views()})
-            if route == "/views/load":
-                name = body.get("name")
-                view = read_view(name)
-                graph, missing = view_to_vis(view, *self.current())
-                return self._send_json({"graph": graph, "missing": missing, **view_state(view, name)})
-            if route == "/views/save":
-                name = body.get("name")
-                write_view(name, clean_view(body))
-                return self._send_json({"ok": True, "name": name})
-        except ViewError as e:
-            return self._send(400, str(e).encode())
-        except (ZkError, OSError) as e:
-            return self._send(500, str(e).encode())
-        self._send(404, b"not found")
-
-    def _refresh(self, paths):
-        """Return updated nodes and valid edges for given paths."""
-        notes_by_path, links, adj = self.current()
-        vis_nodes = [note_to_vis_node(notes_by_path[p], adj) for p in paths if p in notes_by_path]
-        return {"nodes": vis_nodes, "edges": vis_edges(links, paths)}
-
-    def _neighbors(self, path, direction, shown):
-        """Return path's linked notes in `direction`
-        + edges among shown and new nodes."""
-        notes_by_path, links, adj = self.current()
-        neighbor_paths = linked(adj, path, direction)
-        vis_nodes = [note_to_vis_node(notes_by_path[p], adj) for p in neighbor_paths]
-        return {"nodes": vis_nodes, "edges": vis_edges(links, shown | neighbor_paths | {path})}
-
     def log_message(self, format, *args):
         pass  # silence logs
 
 
-def main():
-    global NOTES_DIR
+# ---- CLI ---------------------------------------------------------------------------
+
+def parse_args():
     parser = argparse.ArgumentParser(description="Visualize a zk notebook's link graph in the browser")
     parser.add_argument("--notebook", help="Notebook directory (default: $ZK_NOTEBOOK_DIR or nearest parent with .zk/)")
     parser.add_argument("--filter", default="", help="Filter notes by search string")
@@ -924,61 +576,68 @@ def main():
     args = parser.parse_args()
     if args.view and (args.filter or args.filter_path):
         parser.error("--view can't be combined with --filter/--filter-path")
+    return args
 
-    try:
-        GraphHandler.vis_js = VIS_JS_PATH.read_bytes()
-    except OSError as e:
-        sys.exit(f"Cannot read {VIS_JS_PATH}: {e.strerror}")
 
+def print_views(views):
+    listed = views.list()
+    if not listed:
+        print(f"No saved views in {views.dir}")
+    for v in listed:
+        print(f"{v['name']}\t{v['saved'] or '?'}\t{v['count']} notes")
+
+
+def initial_selection(args, graph, views):
+    """What to show at start, from --view or the filters: {"paths", "positions", "view"}."""
+    if args.view:
+        view = views.read(args.view)
+        paths = [p for p in view["nodes"] if p in graph.notes]
+        dropped = len(view["nodes"]) - len(paths)
+        print(f"View {args.view}: {len(paths)} notes"
+              + (f" ({dropped} deleted notes dropped)" if dropped else ""))
+        return {"paths": paths, "positions": view["nodes"], "view": view_state(view, args.view)}
+    paths = graph.select(args.filter, args.filter_path, args.depth, args.direction)
+    print(f"After filter: {len(paths)} notes")
+    if not paths:
+        print("Warning: no notes matched the filter", file=sys.stderr)
+    origin = {"filter": args.filter, "filter_path": args.filter_path,
+              "depth": args.depth, "direction": args.direction}
+    return {"paths": paths, "positions": None,
+            "view": {"name": None, "viewport": None, "frozen": False, "origin": origin}}
+
+
+def main():
+    args = parse_args()
+    if not (STATIC_DIR / "vis-network.min.js").is_file():
+        sys.exit(f"Missing {STATIC_DIR}/: keep the static/ folder next to the script")
     try:
-        notebook = Path(args.notebook).resolve() if args.notebook else find_notebook_dir(os.getcwd())
-        NOTES_DIR = str(notebook)
-        load_config(notebook)
+        root = Path(args.notebook).resolve() if args.notebook else find_notebook_dir(os.getcwd())
+        config = Config.load(root)
+        views = Views(config.views_dir)
         if args.list_views:
-            views = list_views()
-            if not views:
-                print(f"No saved views in {VIEWS_DIR}")
-            for v in views:
-                print(f"{v['name']}\t{v['saved'] or '?'}\t{v['count']} notes")
-            return
-        view = read_view(args.view) if args.view else None
-        print(f"Loading graph from zk notebook {NOTES_DIR}...")
-        notes_by_path, links, adj = GraphHandler.reload()
+            return print_views(views)
+        if args.view:
+            views.read(args.view)  # fail fast, before the slow zk run
+        print(f"Loading graph from zk notebook {root}...")
+        notebook = Notebook(root)
+        graph = notebook.reload()
+        print(f"Total: {len(graph.notes)} notes, {len(graph.links)} links")
+        initial = initial_selection(args, graph, views)
     except (ZkError, ViewError) as e:
         sys.exit(str(e))
-    print(f"Total: {len(notes_by_path)} notes, {len(links)} links")
-
-    if view:
-        vis_data, missing = view_to_vis(view, notes_by_path, links, adj)
-        state = view_state(view, args.view)
-        print(f"View {args.view}: {len(vis_data['nodes'])} notes"
-              + (f" ({missing} deleted notes dropped)" if missing else ""))
-    else:
-        data = {"notes": list(notes_by_path.values()), "links": links}
-        data = filter_graph(data, adj, args.filter, args.filter_path, args.depth, args.direction)
-        print(f"After filter: {len(data['notes'])} notes, {len(data['links'])} links")
-        if not data["notes"]:
-            print("Warning: no notes matched the filter", file=sys.stderr)
-        vis_data = build_vis_data(data, adj)
-        origin = {"filter": args.filter, "filter_path": args.filter_path,
-                  "depth": args.depth, "direction": args.direction}
-        state = {"name": None, "viewport": None, "frozen": False, "origin": origin}
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), GraphHandler)
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as e:
         sys.exit(f"Cannot bind 127.0.0.1:{args.port}: {e.strerror}. Try another --port.")
     port = server.server_address[1]
-
-    GraphHandler.token = secrets.token_urlsafe(32)
-    GraphHandler.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    GraphHandler.html_content = make_html(vis_data, GraphHandler.token, state).encode()
+    server.app = App(config, notebook, views, initial)
+    server.app.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
 
     url = f"http://127.0.0.1:{port}"
     print(f"Serving graph at {url}")
     if not args.no_open:
         webbrowser.open(url)
-
     try:
         server.serve_forever()
     except KeyboardInterrupt:

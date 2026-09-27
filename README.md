@@ -2,13 +2,17 @@
 
 Interactive, browser-based view of the link graph of a [zk](https://github.com/zk-org/zk) notebook.
 
-A single Python script (standard library only) runs `zk graph`, serves the result on `127.0.0.1`, and draws it with [vis-network](https://visjs.github.io/vis-network/). It works well on notebooks with thousands of notes.
+A Python script (standard library only) runs `zk graph` and serves the result on `127.0.0.1` to a small web page that draws it with [vis-network](https://visjs.github.io/vis-network/). It works well on notebooks with thousands of notes.
 
 ## Features
 
 - Force-directed graph of all notes and links, or only the part around a search term or path prefix.
 - Node size grows (logarithmically) with the number of distinct notes a note is linked with, so hubs stand out.
 - Hover a note to see its title, tags, outgoing/backlink counts and the first lines of its body.
+- **Readable labels**: a label shows only the part of the title before " — " (so "Concept — definition" shows "Concept"), wraps instead of running long, and has a dark outline so edges don't cut through it. Search still matches the full title.
+- **Focus**: hovering a note dims everything except it and its linked notes, and shows their labels at full size. **Click** a note to keep that focus; click empty space to clear it.
+- **Label modes** (**L** or the *Labels* button): *hubs* sizes labels by the note's link count and hides small ones when zoomed out; *all* shows every label at one size; *none* shows labels only for the focused note and its links. The choice is remembered in the browser.
+- A spinner with a seconds counter shows while a slow action runs, e.g. expanding right after the notebook changed, which makes `zk` re-read it.
 - **Double-click** a note to open it in your editor (configurable command).
 - **Right-click** a note to expand the graph from there: add *all linked notes*, only its *outgoing links*, or only its *backlinks*. You can also *remove* it from the view.
 - **Ctrl+click** (⌘+click on macOS) a note is a shortcut for adding its outgoing links.
@@ -33,7 +37,7 @@ git clone https://github.com/artkpv/zk-graph.git
 ln -s "$PWD/zk-graph/zk-graph" ~/.local/bin/zk-graph
 ```
 
-Keep `vis-network.min.js` next to the script. The symlink is resolved, so linking the script from elsewhere is fine.
+Keep the `static/` folder next to the script: it holds the web page. The symlink is resolved, so linking the script from elsewhere is fine.
 
 ## Screenshot
 
@@ -123,8 +127,19 @@ A view file looks like this; note paths are relative to the notebook:
 
 ## Security
 
-The server only listens on `127.0.0.1`. The page gets a random per-run token, and every action endpoint (`/open`, `/neighbors`, `/refresh`) requires it in a custom header (as do the `/views/*` endpoints). The server also rejects requests whose `Host` header isn't its own. So other websites open in your browser can't open files or read your notes, whether by cross-site requests or DNS rebinding. Note paths are only opened if they exist in the notebook, and the open command is run without a shell.
+The server only listens on `127.0.0.1`. The page gets a random per-run token from `/init`, and every action endpoint (`/open`, `/neighbors`, `/refresh`, `/views/*`) requires it in a custom header. Other sites can't read `/init`: the server sends no CORS headers, so the browser keeps its response from them. The server also rejects requests whose `Host` header isn't its own. So other websites open in your browser can't open files or read your notes, whether by cross-site requests or DNS rebinding. Note paths are only opened if they exist in the notebook, and the open command is run without a shell.
+
+## Code layout
+
+| File | What it does |
+|---|---|
+| `zk-graph` | Python server, standard library only. Sections: `Config` (the TOML settings), `Graph` (one snapshot of notes and links) and `Notebook` (the cache that re-runs `zk graph` when files change), conversion to vis-network data, `Views` (saved views), `App` (one method per API route, listed in `API_ROUTES`), the HTTP `Handler`, and the CLI. |
+| `static/index.html`, `static/style.css` | Page markup and styles. |
+| `static/app.js` | Front end, a plain script with no build step. It fetches its data from `GET /init`, then calls `POST /<route>` for everything else. |
+| `static/vis-network.min.js` | The bundled vis-network library. |
+
+Static files are read on every request, so after editing them a page reload is enough; changes to `zk-graph` need a restart.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The bundled `vis-network.min.js` (v10.0.2) is © vis.js contributors, dual-licensed Apache-2.0 / MIT. Its licence header is kept in the file.
+MIT, see [LICENSE](LICENSE). The bundled `static/vis-network.min.js` (v10.0.2) is © vis.js contributors, dual-licensed Apache-2.0 / MIT. Its licence header is kept in the file.
