@@ -7,10 +7,12 @@ A single Python script (standard library only) runs `zk graph`, serves the resul
 ## Features
 
 - Force-directed graph of all notes and links, or only the part around a search term or path prefix.
-- Hover a note to see its title, tags and the first lines of its body.
+- Node size grows (logarithmically) with the number of distinct notes a note is linked with, so hubs stand out.
+- Hover a note to see its title, tags, outgoing/backlink counts and the first lines of its body.
 - **Double-click** a note to open it in your editor (configurable command).
-- **Right-click** a note to *add linked notes* (expand the graph from there) or *remove* it from the view.
+- **Right-click** a note to expand the graph from there: add *all linked notes*, only its *outgoing links*, or only its *backlinks*. You can also *remove* it from the view.
 - **Refresh** re-reads the notebook and updates the displayed notes, dropping deleted notes and syncing changed links.
+- The graph is kept in memory. Expanding and refreshing only re-run `zk graph` if files in the notebook changed since the last load (checked by mtime, which takes milliseconds), so repeat clicks are instant even on large notebooks.
 - Search box (**Ctrl+F**) dims non-matching notes; **Enter** jumps to the first match.
 - **Space** freezes or unfreezes the physics simulation.
 - Colour notes by tag.
@@ -43,6 +45,7 @@ Run it from anywhere inside a notebook:
 zk-graph                                  # whole notebook
 zk-graph --filter "attention"             # notes matching the text, plus their direct neighbours
 zk-graph --filter-path 2025/ --depth 2    # notes under 2025/, plus two hops of links
+zk-graph --filter "attention" --direction in   # ...plus the notes that link to them
 zk-graph --notebook ~/notes --port 9000 --no-open
 ```
 
@@ -52,6 +55,7 @@ zk-graph --notebook ~/notes --port 9000 --no-open
 | `--filter TEXT` | – | Keep notes whose title, lead or path contains `TEXT` (case-insensitive) |
 | `--filter-path PREFIX` | – | Keep notes whose path starts with `PREFIX` |
 | `--depth N` | `1` | Also include notes up to `N` links away from the matched ones |
+| `--direction both\|out\|in` | `both` | Which links `--depth` follows: `out` = notes they link to, `in` = backlinks |
 | `--port N` | `8089` | HTTP port on 127.0.0.1 (`0` picks a free one) |
 | `--no-open` | – | Don't open the browser automatically |
 
