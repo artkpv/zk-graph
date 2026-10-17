@@ -344,15 +344,10 @@ async function refresh() {
     const result = await api("/refresh", { paths: displayed }, "Refreshing notes…");
     // Update notes still shown (not ones removed while waiting), so no notes are added
     nodes.update(result.nodes.filter((n) => nodes.get(n.id)));
-    if (popupNodeId && nodes.get(popupNodeId)) $("popup").innerHTML = nodes.get(popupNodeId).details;
     const fresh = new Set(result.nodes.map((n) => n.id));
     displayed.filter((id) => !fresh.has(id)).forEach(removeNode);
     syncEdges(result.edges, () => true);
-    if (popupEdgeId) {
-      const edge = edges.get(popupEdgeId);
-      const { details } = await api("/link", { from: edge.from, to: edge.to });
-      if (popupEdgeId === edge.id) $("popup").innerHTML = details;
-    }
+    await updatePopup();
     applyStyles();
     setInfo();
   } catch (err) {
@@ -430,26 +425,54 @@ async function loadView(name) {
 let popupNodeId = null;  // note whose details the popup shows
 let popupEdgeId = null;  // or edge whose links it shows
 
-// Show a note's details next to `at` (px in the page).
-function showPopup(id, at) {
-  const node = nodes.get(id);
-  if (!node) return hidePopup();
-  placePopup(node.details, at);
-  popupNodeId = id;
+// A note's details (HTML built and escaped by the server) and its whole body,
+// rendered from Markdown and sanitized: notes may hold raw HTML. Images are
+// dropped, since the server doesn't serve the notebook's files.
+async function noteHtml(id) {
+  const { body } = await api("/note", { path: id }, "Loading note…");
+  if (!body) return nodes.get(id).details;
+  const md = DOMPurify.sanitize(marked.parse(body, { gfm: true, breaks: true }),
+    { FORBID_TAGS: ["img", "style"] });
+  return `${nodes.get(id).details}<hr><div class="md">${md}</div>`;
 }
 
-// Show where an edge's source note links to its target, fetched on demand.
-async function showEdgePopup(id, at) {
+// Where an edge's source note links to its target.
+async function edgeHtml(id) {
   const edge = edges.get(id);
-  if (!edge) return hidePopup();
+  return (await api("/link", { from: edge.from, to: edge.to }, "Loading link…")).details;
+}
+
+// Show a note's details, or an edge's links, next to `at` (px in the page).
+// Both are fetched on click: a note's body can be long.
+async function showPopup(id, at) {
+  if (!nodes.get(id)) return hidePopup();
   hidePopup();
-  popupEdgeId = id;
+  popupNodeId = id;
   try {
-    const { details } = await api("/link", { from: edge.from, to: edge.to }, "Loading link…");
-    if (popupEdgeId === id) placePopup(details, at);  // unless closed or replaced meanwhile
+    const html = await noteHtml(id);
+    if (popupNodeId === id) placePopup(html, at);  // unless closed or replaced meanwhile
   } catch (err) {
     showError(err);
   }
+}
+
+async function showEdgePopup(id, at) {
+  if (!edges.get(id)) return hidePopup();
+  hidePopup();
+  popupEdgeId = id;
+  try {
+    const html = await edgeHtml(id);
+    if (popupEdgeId === id) placePopup(html, at);
+  } catch (err) {
+    showError(err);
+  }
+}
+
+// Re-fetch what the open popup shows, keeping its place and scroll.
+async function updatePopup() {
+  const node = popupNodeId, edge = popupEdgeId;
+  const html = node ? await noteHtml(node) : edge ? await edgeHtml(edge) : null;
+  if (html !== null && popupNodeId === node && popupEdgeId === edge) $("popup").innerHTML = html;
 }
 
 // Fill the popup with `html` (built and escaped by the server) and place it
@@ -535,6 +558,17 @@ function wireKeyboard() {
   });
 }
 
+// Links in a note's body: web links open in a new tab; others (links to
+// notes, relative files) do nothing, rather than navigate away from the graph.
+function wirePopup() {
+  $("popup").addEventListener("click", (e) => {
+    const a = e.target.closest("a[href]");
+    if (!a) return;
+    e.preventDefault();
+    if (/^https?:/i.test(a.getAttribute("href"))) window.open(a.href, "_blank", "noopener");
+  });
+}
+
 function wireContextMenu() {
   document.addEventListener("click", hideCtxMenu);
   $("ctxmenu").querySelectorAll("[data-dir]").forEach((item) => {
@@ -612,6 +646,7 @@ async function main() {
   wireSearch();
   wireKeyboard();
   wireContextMenu();
+  wirePopup();
   wireNetwork();
   setFrozen(init.view.frozen);
   setLabelMode(labelMode);  // also applies the initial styles

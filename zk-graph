@@ -8,6 +8,7 @@ serves the page in static/ plus a small JSON API on 127.0.0.1:
     POST /open             open a note in the editor (config: open_cmd)
     POST /neighbors        a note's linked notes, for expanding the graph
     POST /refresh          fresh content and links for the displayed notes
+    POST /note             a note's body, for its popup
     POST /link             details of the links from one note to another
     POST /views/list|load|save   saved views
 
@@ -42,13 +43,14 @@ STATIC_FILES = {  # URL path -> (file in STATIC_DIR, content type)
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/vis-network.min.js": ("vis-network.min.js", "text/javascript; charset=utf-8"),
+    "/marked.min.js": ("marked.min.js", "text/javascript; charset=utf-8"),
+    "/purify.min.js": ("purify.min.js", "text/javascript; charset=utf-8"),
 }
 CONFIG_NAME = "zk-graph.toml"  # looked up in <notebook>/.zk/
 DIRECTIONS = ("both", "out", "in")
 VIEW_NAME_RE = re.compile(r"\w[\w.-]*")
 LABEL_MAX = 40
 LABEL_SEPARATORS = (" — ", " – ")  # "Concept — definition" -> label "Concept"
-LINK_CONTEXT = 150  # characters of text shown on each side of a link in the edge popup
 LINK_RE = re.compile(r"\[\[[^\]\n]*\]\]|\[[^\]\n]*\]\([^)\n]*\)")  # [[wiki]] or [md](link)
 
 
@@ -264,16 +266,14 @@ def vis_node(note, graph, config):
     path = note["path"]
     full = note_title(note)
     tags = note.get("tags") or []
-    preview = "\n".join((note.get("body") or "").strip().split("\n")[:8])
-    # HTML for the popup shown on clicking the note. Not called "title": vis
+    # HTML for the head of the popup shown on clicking the note; the page
+    # fetches the body (/note) and renders it below. Not called "title": vis
     # would show that as a hover tooltip.
     details = f"<b>{html.escape(full)}</b>"
     if tags:
         details += f"<br><i>{html.escape(', '.join(tags))}</i>"
     details += (f"<br><small>{len(graph.linked(path, 'out'))} outgoing · "
                 f"{len(graph.linked(path, 'in'))} backlinks</small>")
-    if preview:
-        details += f"<hr><pre>{html.escape(preview)}</pre>"
     return {
         "id": path,
         "label": short_label(full),
@@ -293,8 +293,7 @@ def note_title(note):
 def link_context(raw, link):
     """The text around `link` in its source note, as HTML with the link marked.
     zk's snippet is the link's paragraph, or just the link in a list item, so
-    it's widened to whole lines and then cut to LINK_CONTEXT characters on
-    each side of the link."""
+    it's widened to whole lines."""
     data = raw.encode()
     start, end = link.get("snippetStart"), link.get("snippetEnd")
     if isinstance(start, int) and isinstance(end, int) and 0 <= start <= end <= len(data):
@@ -308,13 +307,8 @@ def link_context(raw, link):
     title = link.get("title") or ""
     found = next((m for m in LINK_RE.finditer(text) if title and title in m.group()), None)
     if not found:
-        text = text.strip()
-        return html.escape(text[:2 * LINK_CONTEXT] + ("…" if len(text) > 2 * LINK_CONTEXT else ""))
+        return html.escape(text.strip())
     before, after = text[:found.start()].lstrip(), text[found.end():].rstrip()
-    if len(before) > LINK_CONTEXT:
-        before = "…" + before[-LINK_CONTEXT:].lstrip()
-    if len(after) > LINK_CONTEXT:
-        after = after[:LINK_CONTEXT].rstrip() + "…"
     return f"{html.escape(before)}<mark>{html.escape(found.group())}</mark>{html.escape(after)}"
 
 
@@ -519,6 +513,13 @@ class App:
         """Fresh nodes for the displayed paths that still exist, and the edges among them."""
         return vis_graph(body.get("paths", []), self.notebook.current(), self.config)
 
+    def note(self, body):
+        """The note's Markdown body, for its popup."""
+        note = self.notebook.current().notes.get(body.get("path", ""))
+        if note is None:
+            raise HttpError(404, "unknown note")
+        return {"body": (note.get("body") or "").strip()}
+
     def link(self, body):
         """Details of the link(s) from one note to another."""
         return {"details": link_details(body.get("from", ""), body.get("to", ""),
@@ -544,6 +545,7 @@ API_ROUTES = {
     "/open": App.open,
     "/neighbors": App.neighbors,
     "/refresh": App.refresh,
+    "/note": App.note,
     "/link": App.link,
     "/views/list": App.views_list,
     "/views/load": App.views_load,

@@ -41,13 +41,24 @@ body { margin: 0; overflow: hidden; font-family: sans-serif; background: #1e1e1e
 /* Popup with a note's details or an edge's links, shown on clicking it */
 #popup {
   display: none; position: absolute; z-index: 950; box-sizing: border-box;
-  max-width: min(600px, calc(100vw - 20px)); max-height: 60vh; overflow: auto;
+  max-width: min(640px, calc(100vw - 20px)); max-height: 70vh; overflow: auto;
   background: #2a2a2a; color: #ccc; border: 1px solid #555; border-radius: 4px;
   padding: 12px 14px; font-size: 14px; line-height: 1.5;
   box-shadow: 0 4px 12px rgba(0,0,0,0.5);
 }
 #popup hr { margin: 4px 0; border: 0; border-top: 1px solid #555; }
-#popup pre { margin: 0; white-space: pre-wrap; }
+#popup .md > :first-child { margin-top: 0; }
+#popup .md > :last-child { margin-bottom: 0; }
+#popup .md :is(h1, h2, h3, h4, h5, h6) { font-size: 1em; margin: 0.6em 0 0.2em; color: #ddd; }
+#popup .md :is(p, ul, ol, pre, blockquote, table) { margin: 0.4em 0; }
+#popup .md :is(ul, ol) { padding-left: 1.4em; }
+#popup .md a { color: #6fa8dc; }
+#popup .md code { background: #333; border-radius: 3px; padding: 0 3px; font-size: 0.9em; }
+#popup .md pre code { background: none; padding: 0; }
+#popup .md pre { background: #333; padding: 6px 8px; border-radius: 3px; overflow-x: auto; white-space: pre; }
+#popup .md blockquote { border-left: 3px solid #555; padding-left: 8px; color: #aaa; }
+#popup .md table { border-collapse: collapse; }
+#popup .md :is(th, td) { border: 1px solid #444; padding: 2px 6px; }
 #popup .ctx { white-space: pre-wrap; overflow-wrap: anywhere; }
 #popup mark { background: #4a4a20; color: #fff; border-radius: 2px; }
 
