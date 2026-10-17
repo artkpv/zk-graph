@@ -10,7 +10,7 @@
 
 // ---- Constants ------------------------------------------------------------
 
-const HELP = " — Click: details + focus | Double-click: open | Ctrl+click: add outgoing | " +
+const HELP = " — Click: details + focus (on an edge: where it links) | Double-click: open | Ctrl+click: add outgoing | " +
   "Right-click: expand/remove | Space: freeze | L: labels | Ctrl+F: search | Ctrl+S: save view";
 const LABEL_MODES = ["hubs", "all", "none"];
 const LABEL_SIZE = 12;
@@ -287,7 +287,7 @@ function removeNode(id) {
   nodes.remove(id);
   if (selectedId === id) selectedId = null;
   if (hoverId === id) hoverId = null;
-  if (popupNodeId === id) hidePopup();
+  if (popupNodeId === id || (popupEdgeId && !edges.get(popupEdgeId))) hidePopup();
 }
 
 // Add fresh edges whose endpoints are displayed; drop displayed edges that
@@ -296,6 +296,7 @@ function syncEdges(fresh, isStale) {
   const freshIds = new Set(fresh.map((e) => e.id));
   edges.add(fresh.filter((e) => !edges.get(e.id) && nodes.get(e.from) && nodes.get(e.to)));
   edges.remove(edges.getIds({ filter: (e) => isStale(e) && !freshIds.has(e.id) }));
+  if (popupEdgeId && !edges.get(popupEdgeId)) hidePopup();
 }
 
 // Start new notes on a circle around `center`, so they don't pile up in the
@@ -341,11 +342,17 @@ async function refresh() {
   const displayed = nodes.getIds();
   try {
     const result = await api("/refresh", { paths: displayed }, "Refreshing notes…");
-    nodes.update(result.nodes);
+    // Update notes still shown (not ones removed while waiting), so no notes are added
+    nodes.update(result.nodes.filter((n) => nodes.get(n.id)));
     if (popupNodeId && nodes.get(popupNodeId)) $("popup").innerHTML = nodes.get(popupNodeId).details;
     const fresh = new Set(result.nodes.map((n) => n.id));
     displayed.filter((id) => !fresh.has(id)).forEach(removeNode);
     syncEdges(result.edges, () => true);
+    if (popupEdgeId) {
+      const edge = edges.get(popupEdgeId);
+      const { details } = await api("/link", { from: edge.from, to: edge.to });
+      if (popupEdgeId === edge.id) $("popup").innerHTML = details;
+    }
     applyStyles();
     setInfo();
   } catch (err) {
@@ -421,16 +428,37 @@ async function loadView(name) {
 // ---- UI wiring ----------------------------------------------------------------
 
 let popupNodeId = null;  // note whose details the popup shows
+let popupEdgeId = null;  // or edge whose links it shows
 
-// Show a note's details next to `at` (px in the page), kept inside the window.
+// Show a note's details next to `at` (px in the page).
 function showPopup(id, at) {
   const node = nodes.get(id);
   if (!node) return hidePopup();
+  placePopup(node.details, at);
+  popupNodeId = id;
+}
+
+// Show where an edge's source note links to its target, fetched on demand.
+async function showEdgePopup(id, at) {
+  const edge = edges.get(id);
+  if (!edge) return hidePopup();
+  hidePopup();
+  popupEdgeId = id;
+  try {
+    const { details } = await api("/link", { from: edge.from, to: edge.to }, "Loading link…");
+    if (popupEdgeId === id) placePopup(details, at);  // unless closed or replaced meanwhile
+  } catch (err) {
+    showError(err);
+  }
+}
+
+// Fill the popup with `html` (built and escaped by the server) and place it
+// next to `at` (px in the page), kept inside the window.
+function placePopup(html, at) {
   const popup = $("popup");
-  popup.innerHTML = node.details;  // built and escaped by the server
+  popup.innerHTML = html;
   popup.style.display = "block";
   popup.scrollTop = 0;
-  popupNodeId = id;
   const margin = 10, gap = 16;
   let x = at.x + gap, y = at.y + gap;
   if (x + popup.offsetWidth > innerWidth - margin) x = Math.max(margin, at.x - gap - popup.offsetWidth);
@@ -441,7 +469,7 @@ function showPopup(id, at) {
 
 function hidePopup() {
   $("popup").style.display = "none";
-  popupNodeId = null;
+  popupNodeId = popupEdgeId = null;
 }
 
 let ctxNodeId = null;  // note the context menu was opened on
@@ -531,7 +559,8 @@ function wireNetwork() {
   network.on("doubleClick", (p) => {
     if (p.nodes.length) api("/open", { path: p.nodes[0] }).catch(showError);
   });
-  // Click: show the note's details; Ctrl+click (Cmd+click on macOS): add outgoing links
+  // Click: show the note's details, or the edge's links; Ctrl+click (Cmd+click
+  // on macOS) on a note: add outgoing links
   network.on("click", (p) => {
     const ev = p.event && p.event.srcEvent;
     const id = p.nodes[0];
@@ -540,6 +569,8 @@ function wireNetwork() {
       expand(id, "out");
     } else if (id) {
       showPopup(id, p.pointer.DOM);
+    } else if (p.edges.length) {
+      showEdgePopup(p.edges[0], p.pointer.DOM);
     } else {
       hidePopup();
     }

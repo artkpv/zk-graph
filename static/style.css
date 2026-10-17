@@ -38,7 +38,7 @@ body { margin: 0; overflow: hidden; font-family: sans-serif; background: #1e1e1e
 #ctxmenu div.sep { border-top: 1px solid #444; margin: 2px 0; padding: 0; cursor: default; }
 #ctxmenu .key { float: right; margin-left: 16px; color: #777; }
 
-/* Popup with a note's details, shown on clicking the note */
+/* Popup with a note's details or an edge's links, shown on clicking it */
 #popup {
   display: none; position: absolute; z-index: 950; box-sizing: border-box;
   max-width: min(600px, calc(100vw - 20px)); max-height: 60vh; overflow: auto;
@@ -48,6 +48,8 @@ body { margin: 0; overflow: hidden; font-family: sans-serif; background: #1e1e1e
 }
 #popup hr { margin: 4px 0; border: 0; border-top: 1px solid #555; }
 #popup pre { margin: 0; white-space: pre-wrap; }
+#popup .ctx { white-space: pre-wrap; overflow-wrap: anywhere; }
+#popup mark { background: #4a4a20; color: #fff; border-radius: 2px; }
 
 /* Busy indicator: shown while a request runs longer than a moment */
 #busy {
