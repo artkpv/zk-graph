@@ -1,7 +1,7 @@
 // zk-graph front end: a plain script, no build step.
 //
 // Sections: constants · state · server API and busy indicator · info bar ·
-// network setup · styling (search, focus, label mode) · graph edits ·
+// network setup · tag colours and legend · styling (search, focus, label mode) · graph edits ·
 // saved views · UI wiring · startup.
 //
 // The server (the zk-graph script) serves this page, answers GET /init with
@@ -17,6 +17,12 @@ const LABEL_SIZE = 12;
 const HOVER_FOCUS_MAX = 1500;  // above this many notes, restyling on every hover lags
 const BUSY_DELAY_MS = 150;     // requests faster than this show no busy indicator
 const EXPAND_LABELS = { both: "Adding linked notes", out: "Adding outgoing links", in: "Adding backlinks" };
+// Colours for tags without one in the config, picked by a hash of the tag name
+// so a tag keeps its colour across sessions.
+const TAG_PALETTE = [
+  "#e74c3c", "#f39c12", "#9b59b6", "#2ecc71", "#3498db", "#1abc9c", "#e67e22", "#e84393",
+  "#00cec9", "#a29bfe", "#fd79a8", "#badc58", "#ff7675", "#74b9ff", "#55efc4", "#ffeaa7",
+];
 const COLORS = {
   label: "#ccc", labelHit: "#fff", labelHidden: "rgba(0,0,0,0)", background: "#1e1e1e",
   edge: "#555", edgeFocus: "#aaa", edgeDimmed: "rgba(85,85,85,0.08)",
@@ -31,6 +37,10 @@ let frozen = false;         // physics off
 let currentView = null;     // name of the loaded/saved view, null if none
 let viewOrigin = null;      // CLI options the current view started from
 let dirty = false;          // unsaved changes to the current view
+
+let legendConfig = { tags: [], dirs: [], default: "#97c2fc" };  // from the config file
+let tagStyles = {};         // per-view overrides: {tag: {on, color}}, saved with the view
+let tagPriority = [];       // tags in legend order; a note takes the first one that's on
 
 let labelMode = loadLabelMode();
 let searchQuery = "";
@@ -183,20 +193,98 @@ function toggleFreeze() {
   markDirty();
 }
 
-function renderLegend(legend) {
-  const entries = [
-    ...legend.tags.map(([tag, color]) => ["#" + tag, color]),
-    ...legend.dirs.map(([dir, color]) => [dir + "/ (untagged)", color]),
-    [legend.tags.length || legend.dirs.length ? "Other" : "Note", legend.default],
-  ];
-  const box = $("legend");
-  box.replaceChildren(...entries.map(([label, color]) => {
-    const row = document.createElement("div");
-    const dot = document.createElement("span");
-    dot.style.background = color;
-    row.append(dot, label);
+// ---- Tag colours and the legend ------------------------------------------------
+// The legend lists every tag of the notes on screen. Clicking a tag turns its
+// colour on or off; clicking its dot picks another colour. Both are saved with
+// the view. A note takes the colour of its first tag that's on (in legend
+// order), else its directory's colour, else the default.
+
+function configuredColor(tag) {
+  const found = legendConfig.tags.find(([t]) => t === tag);
+  return found ? found[1] : null;
+}
+
+function autoColor(tag) {
+  let h = 0;
+  for (const ch of tag) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return TAG_PALETTE[h % TAG_PALETTE.length];
+}
+
+function tagColor(tag) {
+  return (tagStyles[tag] && tagStyles[tag].color) || configuredColor(tag) || autoColor(tag);
+}
+
+// Configured tags start on; the rest start off, so a notebook with many tags
+// isn't a rainbow until you pick the tags you care about.
+function tagOn(tag) {
+  const style = tagStyles[tag];
+  return style && typeof style.on === "boolean" ? style.on : configuredColor(tag) !== null;
+}
+
+function setTagStyle(tag, change) {
+  tagStyles[tag] = { ...tagStyles[tag], ...change };
+  markDirty();
+  renderLegend();
+  applyStyles();
+}
+
+function nodeColor(n) {
+  const tags = n.tags || [];
+  const tag = tagPriority.find((t) => tagOn(t) && tags.includes(t));
+  return tag ? tagColor(tag) : n.base || legendConfig.default;
+}
+
+// Tags of the notes on screen: configured ones first, in config order (which
+// decides their priority), then the rest by how many notes have them.
+function shownTags() {
+  const counts = new Map();
+  nodes.forEach((n) => (n.tags || []).forEach((t) => counts.set(t, (counts.get(t) || 0) + 1)));
+  const configured = legendConfig.tags.map(([t]) => t);
+  const rest = [...counts.keys()].filter((t) => !configured.includes(t))
+    .sort((a, b) => counts.get(b) - counts.get(a) || a.localeCompare(b));
+  return { order: [...configured.filter((t) => counts.has(t)), ...rest], counts };
+}
+
+function legendRow(dotColor, label, { off = false, title = "" } = {}) {
+  const row = document.createElement("div");
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  dot.style.background = off ? "transparent" : dotColor;
+  dot.style.borderColor = dotColor;
+  const text = document.createElement("span");
+  text.className = "label";
+  text.textContent = label;
+  row.append(dot, text);
+  row.classList.toggle("off", off);
+  row.title = title;
+  return { row, dot, text };
+}
+
+// Rebuild the legend and the tag priority; call when the shown notes change.
+function renderLegend() {
+  const { order, counts } = shownTags();
+  tagPriority = order;
+  const rows = order.map((tag) => {
+    const on = tagOn(tag);
+    const { row, dot, text } = legendRow(tagColor(tag), `#${tag} (${counts.get(tag)})`, {
+      off: !on, title: "Click: colour on/off · click the dot: change colour",
+    });
+    row.classList.add("tag");
+    text.addEventListener("click", () => setTagStyle(tag, { on: !on }));
+    // A colour input over the dot opens the browser's colour picker
+    const picker = document.createElement("input");
+    picker.type = "color";
+    picker.value = /^#[0-9a-f]{6}$/i.test(tagColor(tag)) ? tagColor(tag) : "#000000";
+    picker.addEventListener("change", () => setTagStyle(tag, { color: picker.value.toLowerCase(), on: true }));
+    dot.append(picker);
     return row;
-  }));
+  });
+  if (!order.length) rows.push(legendRow("transparent", "No tags on shown notes", { off: true }).row);
+  const sep = document.createElement("hr");
+  rows.push(sep,
+    ...legendConfig.dirs.map(([dir, color]) => legendRow(color, dir + "/ (no coloured tag)").row),
+    legendRow(legendConfig.default, legendConfig.dirs.length ? "Other" : "No coloured tag").row);
+  $("legend").replaceChildren(...rows);
 }
 
 // ---- Styling: search, focus and label mode ---------------------------------
@@ -246,6 +334,7 @@ function applyStyles() {
     const showLabel = lit && (focus ? true : labelMode !== "none");
     return {
       id: n.id,
+      color: nodeColor(n),
       opacity: lit ? 1 : 0.12,
       font: {
         color: !showLabel ? COLORS.labelHidden : q && hit ? COLORS.labelHit : COLORS.label,
@@ -321,6 +410,7 @@ async function expand(path, direction) {
     nodes.add(added);
     // Edges among shown + new nodes; stale ones only for the clicked node
     syncEdges(result.edges, (e) => e.from === path || e.to === path);
+    renderLegend();
     applyStyles();
     if (added.length) {
       markDirty();
@@ -348,6 +438,7 @@ async function refresh() {
     displayed.filter((id) => !fresh.has(id)).forEach(removeNode);
     syncEdges(result.edges, () => true);
     await updatePopup();
+    renderLegend();
     applyStyles();
     setInfo();
   } catch (err) {
@@ -379,6 +470,7 @@ async function saveView() {
       nodes: network.getPositions(),
       viewport: { scale: network.getScale(), x: center.x, y: center.y },
       frozen,
+      tags: tagStyles,
       origin: viewOrigin,
     }, `Saving view “${name}”…`);
     currentView = name;
@@ -404,11 +496,13 @@ async function loadView(name) {
     edges.add(v.graph.edges);
     currentView = v.name;
     viewOrigin = v.origin;
+    tagStyles = v.tags || {};
     dirty = false;
     $("search").value = "";
     searchQuery = "";
     selectedId = hoverId = null;
     hidePopup();
+    renderLegend();
     applyStyles();
     applyViewport(v.viewport);
     $("viewSelect").value = v.name;
@@ -583,6 +677,7 @@ function wireContextMenu() {
     hideCtxMenu();
     if (!path) return;
     removeNode(path);
+    renderLegend();
     applyStyles();
     markDirty();
     setInfo();
@@ -640,8 +735,10 @@ async function main() {
   token = init.token;
   currentView = init.view.name;
   viewOrigin = init.view.origin;
-  renderLegend(init.legend);
+  legendConfig = init.legend;
+  tagStyles = init.view.tags || {};
   createNetwork(init.graph, init.view);
+  renderLegend();
   wireToolbar();
   wireSearch();
   wireKeyboard();

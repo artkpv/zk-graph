@@ -21,7 +21,7 @@ A Python script (standard library only) runs `zk graph` and serves the result on
 - **Saved views**: save the current set of notes, their positions and the zoom (**Save view** / **Ctrl+S**), switch between views from the dropdown, or open one with `--view NAME`. See [Saved views](#saved-views).
 - Search box (**Ctrl+F**) dims non-matching notes; **Enter** jumps to the first match.
 - **Space** freezes or unfreezes the physics simulation.
-- Colour notes by tag and by directory.
+- Colour notes by tag and by directory. The legend lists **every tag** of the notes on screen, with counts. **Click** a tag to turn its colour on or off (its notes fall back to their directory or default colour). **Click** a tag's dot to pick another colour. Both are saved with the view.
 - Works offline: vis-network, marked and DOMPurify are bundled, nothing is loaded from a CDN.
 
 ## Requirements
@@ -92,8 +92,10 @@ draft = "#f39c12"
 "permanent" = "#e5c07b"
 ```
 
+`tag_colors` sets the colours and order of the tags you care about; those start switched on. Every other tag found on the shown notes also appears in the legend, with a colour picked from its name, but starts switched off. In the page you can switch any tag on or off and change its colour; that choice is stored in the saved view, not in the config.
+
 A note's colour is decided in this order:
-1. The first tag in `tag_colors` that the note has.
+1. The first switched-on tag the note has, in legend order: the tags in `tag_colors` in their order, then the others by how many shown notes have them.
 2. Otherwise, the most specific directory in `dir_colors` that contains the note. Subdirectories count, so `"journal"` also covers `journal/2026/`, and `"journal/2026"` beats `"journal"`.
 3. Otherwise, `default_color`.
 
@@ -119,11 +121,12 @@ A view file looks like this; note paths are relative to the notebook:
  "nodes": {"0/some-note.md": {"x": 120.5, "y": -40.2}},
  "viewport": {"scale": 0.8, "x": 10.0, "y": 20.0},
  "frozen": true,
+ "tags": {"draft": {"on": false}, "reading": {"on": true, "color": "#3498db"}},
  "origin": {"filter": "attention", "filter_path": "", "depth": 1, "direction": "both"}
 }
 ```
 
-`origin` records the CLI options the view started from. It's informational only.
+`tags` holds the tag colours you changed in the page: whether each is on, and its colour if you picked one. Tags not listed use the config. `origin` records the CLI options the view started from. It's informational only.
 
 ## Security
 

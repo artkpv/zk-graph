@@ -49,6 +49,7 @@ STATIC_FILES = {  # URL path -> (file in STATIC_DIR, content type)
 CONFIG_NAME = "zk-graph.toml"  # looked up in <notebook>/.zk/
 DIRECTIONS = ("both", "out", "in")
 VIEW_NAME_RE = re.compile(r"\w[\w.-]*")
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 LABEL_MAX = 40
 LABEL_SEPARATORS = (" — ", " – ")  # "Concept — definition" -> label "Concept"
 LINK_RE = re.compile(r"\[\[[^\]\n]*\]\]|\[[^\]\n]*\]\([^)\n]*\)")  # [[wiki]] or [md](link)
@@ -110,11 +111,10 @@ class Config:
             cfg.views_dir = notebook / Path(raw["views_dir"]).expanduser()
         return cfg
 
-    def note_color(self, path, tags):
-        """First configured tag colour, else the most specific dir colour, else the default."""
-        for tag, color in self.tag_colors.items():
-            if tag in tags:
-                return color
+    def base_color(self, path):
+        """A note's colour when none of its tags colours it: the most specific
+        dir colour, else the default. Tag colours are applied by the page, which
+        lets you turn each tag's colour on and off."""
         for d, color in self.dir_colors.items():
             if path.startswith(d + "/"):
                 return color
@@ -278,7 +278,8 @@ def vis_node(note, graph, config):
         "id": path,
         "label": short_label(full),
         "full": full,  # for search, which should also match the part cut from the label
-        "color": config.note_color(path, tags),
+        "tags": tags,
+        "base": config.base_color(path),  # the page colours the note by its tags, else this
         "details": details,
         # Size by log of distinct linked notes over the whole notebook, so a few
         # hubs don't shrink everything else to the minimum.
@@ -431,15 +432,34 @@ def clean_view(body):
         "nodes": clean_nodes,
         "viewport": viewport,
         "frozen": bool(body.get("frozen")),
+        "tags": clean_tag_styles(body.get("tags")),
         "origin": origin if isinstance(origin, dict) else None,
     }
+
+
+def clean_tag_styles(tags):
+    """{tag: {"on": bool, "color": "#rrggbb"}}: per-tag overrides of the
+    configured colours, both fields optional. Anything malformed is dropped."""
+    clean = {}
+    for tag, style in (tags.items() if isinstance(tags, dict) else []):
+        if not isinstance(tag, str) or not tag or len(tag) > 200 or not isinstance(style, dict):
+            continue
+        item = {}
+        if isinstance(style.get("on"), bool):
+            item["on"] = style["on"]
+        if isinstance(style.get("color"), str) and COLOR_RE.fullmatch(style["color"]):
+            item["color"] = style["color"].lower()
+        if item:
+            clean[tag] = item
+    return clean
 
 
 def view_state(view, name):
     """What the page needs besides the graph to restore a view."""
     vp = view.get("viewport")
     return {"name": name, "viewport": vp if isinstance(vp, dict) else None,
-            "frozen": bool(view.get("frozen")), "origin": view.get("origin")}
+            "frozen": bool(view.get("frozen")), "tags": clean_tag_styles(view.get("tags")),
+            "origin": view.get("origin")}
 
 
 # ---- Opening notes ----------------------------------------------------------------
@@ -665,7 +685,7 @@ def initial_selection(args, graph, views):
     origin = {"filter": args.filter, "filter_path": args.filter_path,
               "depth": args.depth, "direction": args.direction}
     return {"paths": paths, "positions": None,
-            "view": {"name": None, "viewport": None, "frozen": False, "origin": origin}}
+            "view": {"name": None, "viewport": None, "frozen": False, "tags": {}, "origin": origin}}
 
 
 def main():
