@@ -19,7 +19,12 @@ A Python script (standard library only) runs `zk graph` and serves the result on
 - **Refresh** re-reads the notebook and updates the displayed notes, dropping deleted notes and syncing changed links.
 - The graph is kept in memory. Expanding and refreshing only re-run `zk graph` if files in the notebook changed since the last load (checked by mtime, which takes milliseconds), so repeat clicks are instant even on large notebooks.
 - **Saved views**: save the current set of notes, their positions and the zoom (**Save view** / **Ctrl+S**), switch between views from the dropdown, or open one with `--view NAME`. See [Saved views](#saved-views).
-- Search box (**Ctrl+F**) dims non-matching notes; **Enter** jumps to the first match.
+- **Keyboard, Vimium-style** (turn Vimium off for the page): press **f** and every note on screen gets a one- or two-letter label; type a label to select that note, as a click would, with the same focus on its links. **F** does the same and opens its popup. Then:
+  - **p** or **Enter** shows or hides the selected note's popup, **o** opens it in your editor, **zz** centres the view on it.
+  - **j** / **k** scroll the open popup, **Ctrl+D** / **Ctrl+U** by half a page.
+  - **Esc** closes the popup, then clears the selection; while labels are shown it cancels them, and **Backspace** undoes a typed letter. **Ctrl+G** and **Ctrl+[** do the same as **Esc** everywhere on the page (also in the search box), for when **Esc** is taken by something else.
+  - Labels skip notes the search dims; the selected note's neighbours and the notes nearest the centre get the shortest ones. The arrow keys pan and **PageUp** / **PageDown** zoom.
+- Search box (**/** or **Ctrl+F**) dims non-matching notes; **Enter** jumps to the first match.
 - **Space** freezes or unfreezes the physics simulation.
 - Colour notes by tag and by directory. The legend lists **every tag** of the notes on screen, with counts. **Click** a tag to turn its colour on or off (its notes fall back to their directory or default colour). **Click** a tag's dot to pick another colour. Both are saved with the view.
 - Works offline: vis-network, marked and DOMPurify are bundled, nothing is loaded from a CDN.

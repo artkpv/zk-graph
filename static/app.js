@@ -11,7 +11,8 @@
 // ---- Constants ------------------------------------------------------------
 
 const HELP = " — Click: details + focus (on an edge: where it links) | Double-click: open | Ctrl+click: add outgoing | " +
-  "Right-click: expand/remove | Space: freeze | L: labels | Ctrl+F: search | Ctrl+S: save view";
+  "Right-click: expand/remove | f/F: pick a note (F: + popup), then p: popup, o: open, zz: centre, Esc/Ctrl+G: close | " +
+  "j/k: scroll popup | Space: freeze | L: labels | / or Ctrl+F: search | Ctrl+S: save view";
 const LABEL_MODES = ["hubs", "all", "none"];
 const LABEL_SIZE = 12;
 const HOVER_FOCUS_MAX = 1500;  // above this many notes, restyling on every hover lags
@@ -623,7 +624,8 @@ function wireSearch() {
     timer = setTimeout(() => setSearch(q), 400);
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
+    if (isEscape(e)) {
+      e.preventDefault();
       input.value = "";
       input.dispatchEvent(new Event("input"));
       input.blur();
@@ -632,24 +634,226 @@ function wireSearch() {
       const found = nodes.get({ filter: (n) => matches(n, q) })[0];
       if (!found) return;
       network.focus(found.id, { scale: 1.5, animation: { duration: 500 } });
-      network.selectNodes([found.id]);  // doesn't fire selectNode, so sync by hand
-      syncSelection();
+      selectNode(found.id);
     }
   });
 }
 
-function wireKeyboard() {
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { hideCtxMenu(); hidePopup(); }
-    if (e.ctrlKey || e.metaKey) {
-      if (e.key === "f") { e.preventDefault(); $("search").focus(); $("search").select(); }
-      if (e.key === "s") { e.preventDefault(); saveView(); }
+// ---- Keyboard: hints and commands on the selected note ---------------------
+// Vim-style, for use with Vimium off: f labels each note on screen and typing
+// a label selects that note (F also shows its popup); then Enter/p toggles the
+// popup, o opens the note in the editor, zz centres it, Esc deselects.
+
+const HINT_CHARS = "sadfjklewcmpgh";  // home row first, as in Vimium
+const HINT_MAX = 1500;                // labels beyond this would be too long to type
+const KEY_CHORD_MS = 1000;            // the second key of zz must come within this
+
+let hints = null;                // while picking: {typed, openPopup, items: [{id, code, el}]}
+let lastKey = "", lastKeyAt = 0; // for two-key commands (zz)
+
+// Esc, or Ctrl+G / Ctrl+[ for when Esc belongs to something else (as in vim
+// and Emacs). By physical key, so they work in any keyboard layout.
+function isEscape(e) {
+  return e.key === "Escape" ||
+    (e.ctrlKey && !e.shiftKey && !e.altKey && (e.code === "KeyG" || e.code === "BracketLeft"));
+}
+
+// `n` codes, none a prefix of another, shortest first: one letter each while
+// they suffice, then letters are taken over as prefixes of two-letter codes.
+function hintCodes(n) {
+  const codes = [""];
+  let i = 0;
+  while (i === 0 || codes.length - i < n) {
+    const prefix = codes[i++];
+    for (const c of HINT_CHARS) codes.push(prefix + c);
+  }
+  return codes.slice(i, i + n);
+}
+
+// The page has only the graph under it, so canvas-to-DOM px are page px.
+function nodePoint(id) {
+  return network.canvasToDOM(network.getPosition(id));
+}
+
+// Notes on screen that the search doesn't dim; the selected note's neighbours,
+// then the ones nearest the centre, get the shortest labels.
+function hintTargets() {
+  const near = selectedId && nodes.get(selectedId) ? new Set(network.getConnectedNodes(selectedId)) : new Set();
+  const positions = network.getPositions();
+  const targets = [];
+  for (const n of nodes.get()) {
+    if (searchQuery && !matches(n, searchQuery)) continue;
+    const p = network.canvasToDOM(positions[n.id]);
+    if (p.x < 0 || p.y < 0 || p.x > innerWidth || p.y > innerHeight) continue;
+    targets.push({ id: n.id, near: near.has(n.id), d: Math.hypot(p.x - innerWidth / 2, p.y - innerHeight / 2) });
+  }
+  targets.sort((a, b) => (b.near - a.near) || (a.d - b.d));
+  return targets.slice(0, HINT_MAX);
+}
+
+function startHints(openPopup) {
+  hideCtxMenu();
+  const targets = hintTargets();
+  if (!targets.length) return setInfo("No notes on screen", 2000);
+  const codes = hintCodes(targets.length);
+  const layer = $("hints");
+  hints = {
+    typed: "",
+    openPopup,
+    items: targets.map((t, i) => {
+      const el = document.createElement("span");
+      el.className = "hint";
+      layer.appendChild(el);
+      return { id: t.id, code: codes[i], el };
+    }),
+  };
+  layer.style.display = "block";
+  renderHints();
+  setInfo(`Type a label to select a note${openPopup ? " and show it" : ""} | Backspace: undo a letter | Esc / Ctrl+G: cancel`);
+}
+
+function stopHints() {
+  hints = null;
+  $("hints").style.display = "none";
+  $("hints").replaceChildren();
+  setInfo();
+}
+
+// Show the labels that start with what's typed, the typed part dimmed, each
+// on its note (called on every redraw too, as notes move with the physics).
+function renderHints() {
+  if (!hints) return;
+  for (const it of hints.items) {
+    const show = it.code.startsWith(hints.typed) && nodes.get(it.id);
+    it.el.style.display = show ? "" : "none";
+    if (!show) continue;
+    const p = nodePoint(it.id);
+    it.el.style.left = p.x + "px";
+    it.el.style.top = p.y + "px";
+    if (it.el.dataset.typed !== hints.typed) {
+      it.el.dataset.typed = hints.typed;
+      it.el.innerHTML = `<span class="typed">${hints.typed}</span>${it.code.slice(hints.typed.length)}`;
+    }
+  }
+}
+
+// In hint mode every key is ours: letters pick, the rest don't reach the graph.
+function hintKey(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (isEscape(e)) return stopHints();
+  if (e.key === "Backspace") {
+    hints.typed = hints.typed.slice(0, -1);
+  } else if (e.key.length === 1 && HINT_CHARS.includes(e.key.toLowerCase())) {
+    const typed = hints.typed + e.key.toLowerCase();
+    if (!hints.items.some((it) => it.code.startsWith(typed) && nodes.get(it.id))) return;
+    hints.typed = typed;
+  } else {
+    return;
+  }
+  const hit = hints.items.find((it) => it.code === hints.typed);
+  if (!hit) return renderHints();
+  const { openPopup } = hints;
+  stopHints();
+  selectNode(hit.id);
+  if (openPopup) showPopup(hit.id, nodePoint(hit.id));
+  else hidePopup();
+}
+
+function selectNode(id) {
+  network.selectNodes([id]);  // doesn't fire selectNode, so sync by hand
+  syncSelection();
+}
+
+function clearSelection() {
+  network.unselectAll();
+  syncSelection();
+}
+
+function selectedNote() {
+  return selectedId && nodes.get(selectedId) ? selectedId : null;
+}
+
+function togglePopup() {
+  const id = selectedNote();
+  if (!id) return;
+  if (popupNodeId === id) hidePopup();
+  else showPopup(id, nodePoint(id));
+}
+
+function centreSelected() {
+  const id = selectedNote();
+  if (!id) return;
+  hidePopup();  // it would be left behind
+  network.moveTo({ position: network.getPosition(id), animation: { duration: 400, easingFunction: "easeInOutQuad" } });
+}
+
+function popupOpen() {
+  return $("popup").style.display === "block";
+}
+
+function scrollPopup(px) {
+  $("popup").scrollBy({ top: px });
+}
+
+function handleKey(e) {
+  const key = e.key;
+  const chord = key === lastKey && e.timeStamp - lastKeyAt < KEY_CHORD_MS;
+  lastKey = key;
+  lastKeyAt = e.timeStamp;
+  switch (key) {
+    case "f": return startHints(false);
+    case "F": return startHints(true);
+    case "Enter":
+    case "p": return togglePopup();
+    case "o": {
+      const id = selectedNote();
+      if (id) api("/open", { path: id }).catch(showError);
       return;
     }
-    if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName) || e.altKey) return;
-    if (e.code === "Space") { e.preventDefault(); toggleFreeze(); }
-    if (e.key.toLowerCase() === "l") cycleLabelMode();
-  });
+    case "z":
+      if (chord) { lastKey = ""; centreSelected(); }
+      return;
+    case "j": return scrollPopup(60);
+    case "k": return scrollPopup(-60);
+    case "/":
+      $("search").focus();
+      $("search").select();
+      return;
+    case " ": return toggleFreeze();
+    case "l":
+    case "L": return cycleLabelMode();
+  }
+  return false;  // not ours
+}
+
+function wireKeyboard() {
+  // On window, capturing, so hint mode gets keys before vis-network does
+  // (it pans on arrows); the browser's own use of a key we take is cancelled
+  // (Firefox's find-as-you-type, Ctrl+D/U).
+  window.addEventListener("keydown", (e) => {
+    if (hints) return hintKey(e);
+    const typing = ["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName);
+    if (isEscape(e)) {
+      e.preventDefault();
+      if (popupOpen() || $("ctxmenu").style.display === "block") { hideCtxMenu(); hidePopup(); }
+      else if (!typing) clearSelection();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      const k = e.key.toLowerCase();
+      if (k === "f") { e.preventDefault(); $("search").focus(); $("search").select(); }
+      if (k === "s") { e.preventDefault(); saveView(); }
+      if ((k === "d" || k === "u") && popupOpen() && !e.shiftKey) {
+        e.preventDefault();
+        scrollPopup((k === "d" ? 1 : -1) * $("popup").clientHeight / 2);
+      }
+      return;
+    }
+    if (typing || e.altKey) return;
+    if (e.target.tagName === "BUTTON" && (e.key === "Enter" || e.key === " ")) return;  // presses the button
+    if (handleKey(e) !== false) e.preventDefault();
+  }, true);
 }
 
 // Links in a note's body: web links open in a new tab; others (links to
@@ -718,6 +922,7 @@ function wireNetwork() {
   network.on("selectNode", syncSelection);
   network.on("deselectNode", syncSelection);
   network.on("dragEnd", (p) => { if (p.nodes.length) markDirty(); });
+  network.on("afterDrawing", renderHints);
 }
 
 // ---- Startup --------------------------------------------------------------------
